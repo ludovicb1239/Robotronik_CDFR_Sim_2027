@@ -9,12 +9,25 @@ using UnityEngine;
 /// Convention: X is forward, 0 deg points along +X, Y is left, 90 deg points
 /// along +Y. Angles are counter-clockwise.
 ///
-/// Algorithm: correlation scan matching. Instead of randomly sampling features,
-/// search a small box of (dx, dy, da) around the approximate pose and maximise
-/// a smooth likelihood-field score. The walls are known exactly, the prior is
-/// tight, and obstacles simply contribute a low score rather than breaking a
-/// hypothesis. The search is coarse-to-fine so it cannot miss the true pose
-/// inside the box, then a parabola fit gives sub-cell accuracy.
+/// Scoring: each ray scores exp(-d^2 / 2*sigma^2) against the distance d from
+/// its hit point to the nearest field wall, and the pose score is the mean over
+/// rays. There is no plateau and no cutoff, so the score is smooth everywhere
+/// and every ray contributes to the gradient.
+///
+/// Algorithm: zooming coordinate-descent scan matching. Instead of scoring the
+/// whole (dx, dy, da) box, the search sweeps one axis at a time - heading, then
+/// X, then Y - because a robot pose error is dominated by a single axis at a
+/// time and each axis converges independently around a tight odometry prior.
+/// After every sweep the search range shrinks by ZOOM_FACTOR, so the same sweep
+/// progressively changes from broad exploration into fine refinement of the
+/// peak, and the sub-cell accuracy falls out of the final narrow sweeps rather
+/// than a separate parabola fit.
+///
+/// Cost: a box search samples (2na+1)(2nx+1)(2ny+1) full poses, while one sweep
+/// samples only (2na+1)+(2nx+1)+(2ny+1) and that count is fixed by
+/// POINTS_PER_SWEEP regardless of how coarse or fine the range is. The sweeps
+/// also reuse work the box cannot: the scan is projected once per sweep and each
+/// candidate is a cheap translation or rotation of those points.
 /// </summary>
 public static class PosEstimator
 {
@@ -31,29 +44,55 @@ public static class PosEstimator
         new Vector2( -1000f, 1500f),
     };
 
-    /// <summary>Distance below which a point scores full marks, in mm.</summary>
-    private const float SCORE_PLATEAU_MM = 10f;
-
     /// <summary>Falloff of the score with distance from a wall, in mm.</summary>
-    private const float SCORE_SIGMA_MM = 40f;
+    private const float SCORE_SIGMA_MM = 20f;
 
-    /// <summary>Point further than this from any wall score nothing, in mm.</summary>
-    private const float SCORE_CUTOFF_MM = 200f;
+    // --- Search schedule ---------------------------------------------------
+    /// <summary>Half-width of the initial search box around the approximate pose, in mm.</summary>
+    private const float RANGE_MM = 300f;
 
-    // --- Coarse pass ---
-    private const float COARSE_XY_RANGE_MM = 200f;
-    private const float COARSE_XY_STEP_MM = 25f;
-    private const float COARSE_ANGLE_RANGE_DEG = 10f;
-    private const float COARSE_ANGLE_STEP_DEG = 1f;
+    /// <summary>Half-width of the initial search box around the approximate heading, in degrees.</summary>
+    private const float ANGLE_RANGE_DEG = 30f;
 
-    // --- Fine pass, centred on the coarse winner ---
-    private const float FINE_XY_RANGE_MM = 60f;
-    private const float FINE_XY_STEP_MM = 5f;
-    private const float FINE_ANGLE_RANGE_DEG = 1.5f;
-    private const float FINE_ANGLE_STEP_DEG = 0.2f;
+    /// <summary>Total number of coordinate-descent sweeps performed per estimate.</summary>
+    private const int TOTAL_STEPS = 10;
 
-    /// <summary>Score of the approximate position must be beaten by this much to accept.</summary>
-    private const float MIN_SCORE_GAIN = 0.02f;
+    /// <summary>
+    /// Sample points taken on each side of the current best, per sweep. A sweep
+    /// therefore evaluates 2*POINTS_PER_SWEEP+1 candidates per axis.
+    /// </summary>
+    private const int POINTS_PER_SWEEP = 20;
+
+    /// <summary>
+    /// Shrink applied to the search range after every sweep. Below 1 this
+    /// zooms in on the current peak, giving coarse-to-fine behaviour without
+    /// separate stages: early sweeps explore the box, later sweeps refine.
+    /// </summary>
+    private const float ZOOM_FACTOR = 0.6f;
+
+    /// <summary>
+    /// Smallest search range worth using, in mm. The range is clamped here so
+    /// the step never collapses into denormal territory, which would waste the
+    /// remaining steps and make the sweep positions numerically meaningless.
+    /// </summary>
+    private const float MIN_RANGE_MM = 1f;
+
+    /// <summary>Smallest search range worth using, in degrees.</summary>
+    private const float MIN_ANGLE_RANGE_DEG = 0.1f;
+
+    /// <summary>
+    /// Stop early once a sweep improves the score by less than this, as a
+    /// guard against burning the remaining steps on a converged result.
+    /// </summary>
+    private const float SWEEP_CONVERGENCE_EPSILON = 1e-3f;
+
+    /// <summary>
+    /// Fraction of the available score headroom the search must capture to
+    /// accept the estimate. Normalising by the headroom makes the test
+    /// scale-invariant, so a scan dominated by obstacles (which caps the
+    /// achievable score well below 1) is not rejected for that reason alone.
+    /// </summary>
+    private const float MIN_SCORE_GAIN_FRACTION = 0.02f;
 
     /// <summary>True when the last estimate failed and the approximate position was kept.</summary>
     public static bool LastEstimateWasRejected { get; private set; }
@@ -107,10 +146,10 @@ public static class PosEstimator
     /// <summary>
     /// Refines the robot's position with correlation scan matching.
     ///
-    /// Every candidate is a full robot pose, and its point cloud is re-projected
-    /// from that pose, so the rotation happens about the robot's centre and the
-    /// pose that maximises the score is the answer - no pivot bookkeeping and no
-    /// frame conversion on the way out.
+    /// The pose is recovered one axis at a time (heading, then X, then Y), so
+    /// the search cost grows linearly with the grid resolution instead of
+    /// cubically. Every candidate is still a full robot pose, projected from the
+    /// robot's centre, so no pivot bookkeeping or frame conversion is needed.
     /// </summary>
     /// <param name="approximate_position">Best guess of the robot's position, e.g. from odometry.</param>
     /// <param name="measurements">Latest lidar scan.</param>
@@ -132,75 +171,35 @@ public static class PosEstimator
 
         float base_score = ScorePose(measurements, approximate_position, lidar_offset);
 
-        float best_x = approximate_position.pos_x;
-        float best_y = approximate_position.pos_y;
-        float best_a = approximate_position.pos_a;
-        float best_score = base_score;
+        // --- Zooming coordinate-descent search ------------------------------
+        PoseEstimate best = Search(measurements, approximate_position, lidar_offset);
 
-        // --- Coarse pass: cover the whole expected odometry error -----------
-        Search(measurements, approximate_position, lidar_offset,
-               COARSE_XY_RANGE_MM, COARSE_XY_STEP_MM,
-               COARSE_ANGLE_RANGE_DEG, COARSE_ANGLE_STEP_DEG,
-               ref best_x, ref best_y, ref best_a, ref best_score);
-
-        // --- Fine pass: refine around the coarse winner ---------------------
-        float coarse_score = best_score;
-        Pos coarse_pose = new Pos { pos_x = best_x, pos_y = best_y, pos_a = best_a };
-
-        Search(measurements, coarse_pose, lidar_offset,
-               FINE_XY_RANGE_MM, FINE_XY_STEP_MM,
-               FINE_ANGLE_RANGE_DEG, FINE_ANGLE_STEP_DEG,
-               ref best_x, ref best_y, ref best_a, ref best_score);
-
-        // --- Sub-cell refinement --------------------------------------------
-        // Fit a parabola through the winner and its neighbours on each axis so
-        // the result is not quantised to the grid step.
-        best_x += ParabolaOffset(
-            ScorePose(measurements, OffsetPose(best_x, best_y, best_a, -FINE_XY_STEP_MM, 0f, 0f), lidar_offset),
-            best_score,
-            ScorePose(measurements, OffsetPose(best_x, best_y, best_a, FINE_XY_STEP_MM, 0f, 0f), lidar_offset),
-            FINE_XY_STEP_MM);
-
-        best_y += ParabolaOffset(
-            ScorePose(measurements, OffsetPose(best_x, best_y, best_a, 0f, -FINE_XY_STEP_MM, 0f), lidar_offset),
-            best_score,
-            ScorePose(measurements, OffsetPose(best_x, best_y, best_a, 0f, FINE_XY_STEP_MM, 0f), lidar_offset),
-            FINE_XY_STEP_MM);
-
-        best_a += ParabolaOffset(
-            ScorePose(measurements, OffsetPose(best_x, best_y, best_a, 0f, 0f, -FINE_ANGLE_STEP_DEG), lidar_offset),
-            best_score,
-            ScorePose(measurements, OffsetPose(best_x, best_y, best_a, 0f, 0f, FINE_ANGLE_STEP_DEG), lidar_offset),
-            FINE_ANGLE_STEP_DEG);
-
-        float improved = best_score - base_score;
+        float best_x = best.x;
+        float best_y = best.y;
+        float best_a = best.a;
+        float best_score = best.score;
 
         // --- Acceptance ------------------------------------------------------
         // Reject only when the search genuinely failed to improve on the input.
-        // A low absolute score is fine: it just means many rays hit obstacles.
-        if (improved < MIN_SCORE_GAIN)
+        // The gain is measured against the headroom left above the base score,
+        // so it does not depend on how high the achievable score is for this
+        // particular scan.
+        float headroom = 1f - base_score;
+        float relative_gain = headroom > Mathf.Epsilon
+            ? (best_score - base_score) / headroom
+            : 0f;
+
+        if (relative_gain < MIN_SCORE_GAIN_FRACTION)
         {
             Reject($"search found no improvement (base score {base_score:F3}, " +
-                   $"best {best_score:F3}, gain {improved:F3} below {MIN_SCORE_GAIN:F3}; " +
-                   $"coarse pass reached {coarse_score:F3})");
+                   $"best {best_score:F3}, gain {relative_gain:P1} of {headroom:F3} headroom " +
+                   $"below {MIN_SCORE_GAIN_FRACTION:P1})");
             return approximate_position;
         }
 
         Pos estimated_position = new Pos { pos_x = best_x, pos_y = best_y, pos_a = best_a };
 
-        Debug.Log($"PosEstimator: {measurements.Count} rays, score {base_score:F3} -> {best_score:F3}, " +
-                  $"correction (dx {best_x - approximate_position.pos_x:F0}, " +
-                  $"dy {best_y - approximate_position.pos_y:F0}, " +
-                  $"da {best_a - approximate_position.pos_a:F2}), " +
-                  $"estimated ({estimated_position.pos_x:F0}, {estimated_position.pos_y:F0}, {estimated_position.pos_a:F2})");
-
         return estimated_position;
-    }
-
-    /// <summary>Returns a copy of a pose with an offset applied to each component.</summary>
-    private static Pos OffsetPose(float x, float y, float a, float dx, float dy, float da)
-    {
-        return new Pos { pos_x = x + dx, pos_y = y + dy, pos_a = a + da };
     }
 
     /// <summary>
@@ -244,100 +243,265 @@ public static class PosEstimator
         return ScoreProjected(ProjectScan(measurements, pose, lidar_offset, buffer));
     }
 
+    /// <summary>Outcome of one search schedule.</summary>
+    private struct PoseEstimate
+    {
+        public float x;
+        public float y;
+        public float a;
+        public float score;
+    }
+
+    /// <summary>Scratch buffer for one schedule, reused by every sweep.</summary>
+    private sealed class SearchWorkspace
+    {
+        // Projected scan for the best pose found so far.
+        public readonly Vector2[] base_points;
+
+        public SearchWorkspace(int rays)
+        {
+            base_points = new Vector2[rays];
+        }
+    }
+
     /// <summary>
-    /// Scores projected points. Each point contributes 1 when on a wall, then
-    /// falls off smoothly with distance, so the score has a gradient pointing
-    /// toward the correct pose instead of a hard inlier cliff.
+    /// Runs a zooming coordinate-descent search: repeatedly sweeps the heading,
+    /// then X, then Y, sampling POINTS_PER_SWEEP either side of the current best
+    /// on each axis, and shrinking the search range by ZOOM_FACTOR after every
+    /// sweep.
+    ///
+    /// There are no separate coarse and fine stages: the early sweeps explore
+    /// the whole RANGE_MM box with a wide step, and the zoom turns the same
+    /// sweep into ever finer refinement of the peak it has found. Each sweep
+    /// keeps the other two coordinates fixed, so a sweep costs only
+    /// 3*(2*POINTS_PER_SWEEP+1) pose evaluations regardless of how coarse or
+    /// fine it is.
+    ///
+    /// The range is clamped to a floor so the step never collapses to zero and
+    /// the search keeps making progress until TOTAL_STEPS is exhausted.
+    /// </summary>
+    private static PoseEstimate Search(
+        List<Lidar.Measurement> measurements,
+        Pos centre,
+        Pos lidar_offset)
+    {
+        SearchWorkspace workspace = new SearchWorkspace(measurements.Count);
+
+        PoseEstimate best = new PoseEstimate
+        {
+            x = centre.pos_x,
+            y = centre.pos_y,
+            a = centre.pos_a,
+            score = ScorePose(measurements, centre, lidar_offset),
+        };
+
+        float range_mm = RANGE_MM;
+        float range_deg = ANGLE_RANGE_DEG;
+
+        for (int step_index = 0; step_index < TOTAL_STEPS; step_index++)
+        {
+            float sweep_start_score = best.score;
+
+            float xy_step = range_mm / POINTS_PER_SWEEP;
+            float angle_step = range_deg / POINTS_PER_SWEEP;
+
+            SweepAngle(measurements, lidar_offset, workspace, POINTS_PER_SWEEP, angle_step, ref best);
+            SweepX(measurements, lidar_offset, workspace, POINTS_PER_SWEEP, xy_step, ref best);
+            SweepY(measurements, lidar_offset, workspace, POINTS_PER_SWEEP, xy_step, ref best);
+
+            float gain = best.score - sweep_start_score;
+
+            // Zoom in on the peak, never below the smallest useful range.
+            range_mm = Mathf.Max(MIN_RANGE_MM, range_mm * ZOOM_FACTOR);
+            range_deg = Mathf.Max(MIN_ANGLE_RANGE_DEG, range_deg * ZOOM_FACTOR);
+
+            if (gain < SWEEP_CONVERGENCE_EPSILON)
+            {
+                break;
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// Sweeps X with Y and the heading fixed.
+    ///
+    /// Moving the robot along X translates the whole projected scan along X, so
+    /// the scan is projected once and each candidate is a cheap shift of it.
+    /// </summary>
+    private static void SweepX(
+        List<Lidar.Measurement> measurements,
+        Pos lidar_offset,
+        SearchWorkspace workspace,
+        int steps,
+        float step,
+        ref PoseEstimate best)
+    {
+        // Projected with the robot at x = 0; adding the candidate x to every
+        // point (and to the lidar origin) is the same as moving the robot.
+        ProjectScan(measurements, new Pos { pos_x = 0f, pos_y = best.y, pos_a = best.a },
+                    lidar_offset, workspace.base_points);
+
+        float best_x = best.x;
+        float best_score = best.score;
+
+        for (int xi = -steps; xi <= steps; xi++)
+        {
+            float x = best.x + xi * step;
+            float score = 0f;
+
+            for (int i = 0; i < workspace.base_points.Length; i++)
+            {
+                Vector2 point = workspace.base_points[i];
+                point.x += x;
+
+                score += PointScore(DistanceToNearestWall(point, out _, out _));
+            }
+
+            score /= workspace.base_points.Length;
+
+            if (score > best_score)
+            {
+                best_score = score;
+                best_x = x;
+            }
+        }
+
+        best.x = best_x;
+        best.score = best_score;
+    }
+
+    /// <summary>
+    /// Sweeps Y with X and the heading fixed, again by translating the scan.
+    /// Every ray is evaluated per candidate; the score has no cutoff, so even a
+    /// far ray still contributes a small amount and cannot be skipped.
+    /// </summary>
+    private static void SweepY(
+        List<Lidar.Measurement> measurements,
+        Pos lidar_offset,
+        SearchWorkspace workspace,
+        int steps,
+        float step,
+        ref PoseEstimate best)
+    {
+        ProjectScan(measurements, new Pos { pos_x = best.x, pos_y = 0f, pos_a = best.a },
+                    lidar_offset, workspace.base_points);
+
+        float best_y = best.y;
+        float best_score = best.score;
+
+        for (int yi = -steps; yi <= steps; yi++)
+        {
+            float y = best.y + yi * step;
+            float score = 0f;
+
+            for (int i = 0; i < workspace.base_points.Length; i++)
+            {
+                Vector2 point = workspace.base_points[i];
+                point.y += y;
+                score += PointScore(DistanceToNearestWall(point, out _, out _));
+            }
+
+            score /= workspace.base_points.Length;
+
+            if (score > best_score)
+            {
+                best_score = score;
+                best_y = y;
+            }
+        }
+
+        best.y = best_y;
+        best.score = best_score;
+    }
+
+    /// <summary>
+    /// Sweeps the heading with X and Y fixed.
+    ///
+    /// Rotating the robot swings every ray, and the lidar offset makes each
+    /// projected point travel on an arc about the robot's centre. The score has
+    /// no plateau, so every point changes score under rotation and all rays are
+    /// evaluated per candidate.
+    /// </summary>
+    private static void SweepAngle(
+        List<Lidar.Measurement> measurements,
+        Pos lidar_offset,
+        SearchWorkspace workspace,
+        int steps,
+        float step,
+        ref PoseEstimate best)
+    {
+        Pos best_pose = new Pos { pos_x = best.x, pos_y = best.y, pos_a = best.a };
+        ProjectScan(measurements, best_pose, lidar_offset, workspace.base_points);
+
+        float centre_x = best.x;
+        float centre_y = best.y;
+
+        float best_a = best.a;
+        float best_score = best.score;
+
+        for (int ai = -steps; ai <= steps; ai++)
+        {
+            float angle = best.a + ai * step;
+            float delta = (angle - best.a) * Mathf.Deg2Rad;
+            float cos_d = Mathf.Cos(delta);
+            float sin_d = Mathf.Sin(delta);
+
+            float score = 0f;
+
+            for (int i = 0; i < workspace.base_points.Length; i++)
+            {
+                // Rotate the point about the robot centre by delta.
+                Vector2 point = workspace.base_points[i];
+                float offset_x = point.x - centre_x;
+                float offset_y = point.y - centre_y;
+
+                Vector2 rotated = new Vector2(
+                    centre_x + offset_x * cos_d - offset_y * sin_d,
+                    centre_y + offset_x * sin_d + offset_y * cos_d);
+
+                score += PointScore(DistanceToNearestWall(rotated, out _, out _));
+            }
+
+            score /= workspace.base_points.Length;
+
+            if (score > best_score)
+            {
+                best_score = score;
+                best_a = angle;
+            }
+        }
+
+        best.a = best_a;
+        best.score = best_score;
+    }
+
+    /// <summary>
+    /// Score contribution of a single point at a given distance from the nearest
+    /// wall: a plain Gaussian, maximal on the wall and never exactly zero.
+    /// </summary>
+    private static float PointScore(float distance)
+    {
+        float sigma = SCORE_SIGMA_MM;
+        return Mathf.Exp(-(distance * distance) / (2f * sigma * sigma));
+    }
+
+    /// <summary>
+    /// Scores projected points by the mean Gaussian distance-to-wall score. The
+    /// falloff is smooth, so the score has a gradient pointing toward the
+    /// correct pose instead of a hard inlier cliff.
     /// </summary>
     private static float ScoreProjected(Vector2[] points)
     {
         float score = 0f;
-        float two_sigma_sq = 2f * SCORE_SIGMA_MM * SCORE_SIGMA_MM;
 
         for (int i = 0; i < points.Length; i++)
         {
-            float distance = DistanceToNearestWall(points[i], out _, out _);
-
-            if (distance <= SCORE_PLATEAU_MM)
-            {
-                score += 1f;
-            }
-            else if (distance < SCORE_CUTOFF_MM)
-            {
-                float excess = distance - SCORE_PLATEAU_MM;
-                score += Mathf.Exp(-(excess * excess) / two_sigma_sq);
-            }
+            score += PointScore(DistanceToNearestWall(points[i], out _, out _));
         }
 
         return points.Length > 0 ? score / points.Length : 0f;
-    }
-
-    /// <summary>
-    /// Scans a grid of pose offsets around a centre pose and keeps the best.
-    /// </summary>
-    private static void Search(
-        List<Lidar.Measurement> measurements,
-        Pos centre,
-        Pos lidar_offset,
-        float xy_range,
-        float xy_step,
-        float angle_range,
-        float angle_step,
-        ref float best_x,
-        ref float best_y,
-        ref float best_a,
-        ref float best_score)
-    {
-        int xy_steps = Mathf.Max(1, Mathf.RoundToInt(xy_range / xy_step));
-        int angle_steps = Mathf.Max(1, Mathf.RoundToInt(angle_range / angle_step));
-
-        Vector2[] buffer = new Vector2[measurements.Count];
-
-        for (int ai = -angle_steps; ai <= angle_steps; ai++)
-        {
-            float angle = centre.pos_a + ai * angle_step;
-
-            for (int xi = -xy_steps; xi <= xy_steps; xi++)
-            {
-                float x = centre.pos_x + xi * xy_step;
-
-                for (int yi = -xy_steps; yi <= xy_steps; yi++)
-                {
-                    float y = centre.pos_y + yi * xy_step;
-                    Pos candidate = new Pos { pos_x = x, pos_y = y, pos_a = angle };
-
-                    // Project and score without allocating.
-                    float score = ScoreProjected(ProjectScan(measurements, candidate, lidar_offset, buffer));
-
-                    if (score > best_score)
-                    {
-                        best_score = score;
-                        best_x = x;
-                        best_y = y;
-                        best_a = angle;
-                    }
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Vertex offset of the parabola through (left, centre, right), used to get
-    /// sub-cell accuracy from three grid samples.
-    /// </summary>
-    private static float ParabolaOffset(float left, float centre, float right, float step)
-    {
-        float denominator = left - 2f * centre + right;
-
-        if (Mathf.Abs(denominator) < Mathf.Epsilon)
-        {
-            return 0f;
-        }
-
-        float offset = 0.5f * (left - right) / denominator;
-
-        // Clamp to half a cell: the vertex should sit between the samples.
-        return Mathf.Clamp(offset, -0.5f, 0.5f) * step;
     }
 
     /// <summary>

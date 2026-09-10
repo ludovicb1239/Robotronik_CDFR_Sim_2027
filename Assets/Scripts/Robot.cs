@@ -48,6 +48,7 @@ public class Robot : MonoBehaviour
 
             Pos estimated_position = EstimatePosition(approximate_position, lidar.measurements, lidar_offset);
 
+            // Ground truth in the estimator's frame, for measuring the residual.
             Pos real_position = new Pos
             {
                 pos_x = transform.position.x * 1000f,
@@ -55,16 +56,12 @@ public class Robot : MonoBehaviour
                 pos_a = -unity_yaw,
             };
 
-            Debug.Log($"Real: " +
-                      $"({real_position.pos_x:F0}, {real_position.pos_y:F0}, {real_position.pos_a:F1}) mm/deg | " +
-                      $"Approx: " +
-                      $"({approximate_position.pos_x:F0}, {approximate_position.pos_y:F0}, {approximate_position.pos_a:F1}) mm/deg | " +
-                      $"Error: ({approximate_position.pos_x - real_position.pos_x:F0}, " +
+            Debug.Log($"PosEstimator: error " +
+                      $"({approximate_position.pos_x - real_position.pos_x:F0}, " +
                       $"{approximate_position.pos_y - real_position.pos_y:F0}, " +
-                      $"{approximate_position.pos_a - real_position.pos_a:F1}) | " +
-                      $"Estimated: " +
-                      $"({estimated_position.pos_x:F0}, {estimated_position.pos_y:F0}, {estimated_position.pos_a:F1}) mm/deg | " +
-                      $"Residual: ({estimated_position.pos_x - real_position.pos_x:F0}, " +
+                      $"{approximate_position.pos_a - real_position.pos_a:F1}) " +
+                      $"-> residual " +
+                      $"({estimated_position.pos_x - real_position.pos_x:F0}, " +
                       $"{estimated_position.pos_y - real_position.pos_y:F0}, " +
                       $"{estimated_position.pos_a - real_position.pos_a:F1})");
 
