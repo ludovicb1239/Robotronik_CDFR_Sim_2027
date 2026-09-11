@@ -28,6 +28,18 @@ using UnityEngine;
 /// POINTS_PER_SWEEP regardless of how coarse or fine the range is. The sweeps
 /// also reuse work the box cannot: the scan is projected once per sweep and each
 /// candidate is a cheap translation or rotation of those points.
+///
+/// The inner loop is kept cheap by three things, in order of impact:
+/// 1. distance-to-wall comes from a baked distance field (a bilinear lookup)
+///    instead of a walk over every wall segment;
+/// 2. each ray's range and bearing are baked once per scan, so projection
+///    carries no per-ray trigonometry;
+/// 3. the score is a plain Gaussian, which the compiler turns into a single
+///    multiply and an Exp.
+///
+/// Note: scoring every ray matters for correctness, not just cost. Rays that hit
+/// obstacles are repeatable features, and dropping them leaves the search with
+/// too few constraints, which lets it drift. Obstacle rays are therefore kept.
 /// </summary>
 public static class PosEstimator
 {
@@ -47,15 +59,48 @@ public static class PosEstimator
     /// <summary>Falloff of the score with distance from a wall, in mm.</summary>
     private const float SCORE_SIGMA_MM = 20f;
 
+    // --- Distance field ----------------------------------------------------
+    /// <summary>
+    /// Cell size of the baked distance-to-nearest-wall grid, in mm. The field is
+    /// sampled bilinearly, so the error is a small fraction of a cell; 2 mm
+    /// keeps it far below the lidar's own precision while staying cache friendly.
+    /// </summary>
+    private const float FIELD_CELL_MM = 2f;
+
+    /// <summary>Half-extent of the baked grid, covering the field plus a margin, in mm.</summary>
+    private const float FIELD_HALF_MM = 2000f;
+
+    /// <summary>Number of cells along each axis of the distance field.</summary>
+    private const int FIELD_SIZE = 2001; // 2*FIELD_HALF_MM / FIELD_CELL_MM + 1
+
+    /// <summary>
+    /// Distance from every grid node to the nearest wall, in tenths of a
+    /// millimetre. Stored as short rather than float to halve the working set:
+    /// 0.1 mm quantisation is far below the 0.5 mm target and the field is
+    /// sampled millions of times, so cache residency matters.
+    /// </summary>
+    private static short[] distance_field;
+
+    /// <summary>Scale from the stored short back to millimetres.</summary>
+    private const float FIELD_UNIT_MM = 0.1f;
+
+    /// <summary>What the distance field is evaluated to at least, in mm.</summary>
+    private const float FIELD_MAX_DISTANCE_MM = 500f;
+
+    // Per-ray invariants for the current scan, baked by PrepareScan.
+    private static float[] scan_cos;
+    private static float[] scan_sin;
+    private static float[] scan_range_mm;
+
     // --- Search schedule ---------------------------------------------------
     /// <summary>Half-width of the initial search box around the approximate pose, in mm.</summary>
-    private const float RANGE_MM = 300f;
+    private const float RANGE_MM = 200f;
 
     /// <summary>Half-width of the initial search box around the approximate heading, in degrees.</summary>
-    private const float ANGLE_RANGE_DEG = 30f;
+    private const float ANGLE_RANGE_DEG = 20f;
 
     /// <summary>Total number of coordinate-descent sweeps performed per estimate.</summary>
-    private const int TOTAL_STEPS = 10;
+    private const int TOTAL_STEPS = 12;
 
     /// <summary>
     /// Sample points taken on each side of the current best, per sweep. A sweep
@@ -81,12 +126,6 @@ public static class PosEstimator
     private const float MIN_ANGLE_RANGE_DEG = 0.1f;
 
     /// <summary>
-    /// Stop early once a sweep improves the score by less than this, as a
-    /// guard against burning the remaining steps on a converged result.
-    /// </summary>
-    private const float SWEEP_CONVERGENCE_EPSILON = 1e-3f;
-
-    /// <summary>
     /// Fraction of the available score headroom the search must capture to
     /// accept the estimate. Normalising by the headroom makes the test
     /// scale-invariant, so a scan dominated by obstacles (which caps the
@@ -100,9 +139,82 @@ public static class PosEstimator
     /// <summary>Reason the last estimate was rejected (empty when accepted).</summary>
     public static string LastRejectionReason { get; private set; } = string.Empty;
 
+    /// <summary>Wall-clock duration of the last estimate, in milliseconds.</summary>
+    public static double LastEstimateMs { get; private set; }
+
+    /// <summary>Sweeps the last estimate actually ran before converging.</summary>
+    public static int LastSweepCount { get; private set; }
+
+    /// <summary>
+    /// Bakes the distance-to-nearest-wall field. Called once, lazily, before the
+    /// first estimate. Each node stores the clamped distance so the far field
+    /// saturates instead of growing without bound - beyond
+    /// FIELD_MAX_DISTANCE_MM the exact value never affects the score.
+    /// </summary>
+    private static void BuildDistanceField()
+    {
+        short[] field = new short[FIELD_SIZE * FIELD_SIZE];
+
+        for (int iy = 0; iy < FIELD_SIZE; iy++)
+        {
+            float y = -FIELD_HALF_MM + iy * FIELD_CELL_MM;
+
+            for (int ix = 0; ix < FIELD_SIZE; ix++)
+            {
+                float x = -FIELD_HALF_MM + ix * FIELD_CELL_MM;
+
+                float distance = DistanceToNearestWall(new Vector2(x, y), out _, out _);
+                distance = Mathf.Min(distance, FIELD_MAX_DISTANCE_MM);
+
+                field[iy * FIELD_SIZE + ix] = (short)Mathf.RoundToInt(distance / FIELD_UNIT_MM);
+            }
+        }
+
+        distance_field = field;
+    }
+
+    /// <summary>
+    /// Distance to the nearest wall at a point, in mm, by bilinear interpolation
+    /// of the baked field. This is the hot path: it replaces a loop over every
+    /// wall segment with four loads and a handful of multiplies.
+    /// </summary>
+    private static float SampleDistanceField(float x, float y)
+    {
+        float fx = (x + FIELD_HALF_MM) / FIELD_CELL_MM;
+        float fy = (y + FIELD_HALF_MM) / FIELD_CELL_MM;
+
+        // Outside the baked grid: clamp to the border, whose value is the
+        // saturated distance, so the score is uniformly zero out there.
+        if (fx <= 0f || fy <= 0f || fx >= FIELD_SIZE - 1 || fy >= FIELD_SIZE - 1)
+        {
+            return FIELD_MAX_DISTANCE_MM;
+        }
+
+        int ix = (int)fx;
+        int iy = (int)fy;
+
+        float tx = fx - ix;
+        float ty = fy - iy;
+
+        int row = iy * FIELD_SIZE + ix;
+
+        // Interpolate in the stored units, then scale once at the end.
+        float d00 = distance_field[row];
+        float d10 = distance_field[row + 1];
+        float d01 = distance_field[row + FIELD_SIZE];
+        float d11 = distance_field[row + FIELD_SIZE + 1];
+
+        // Bilinear blend; the compiler vectorises the fixed mixes.
+        float top = d00 + (d10 - d00) * tx;
+        float bottom = d01 + (d11 - d01) * tx;
+
+        return (top + (bottom - top) * ty) * FIELD_UNIT_MM;
+    }
+
     /// <summary>
     /// Distance from a point to a field wall segment, clamped to the segment ends.
-    /// Also returns the wall's direction and normal.
+    /// Also returns the wall's direction and normal. This is the exact routine,
+    /// used only to bake the distance field.
     /// </summary>
     private static float DistanceToNearestWall(Vector2 point, out Vector2 wall_direction, out Vector2 wall_normal)
     {
@@ -169,10 +281,25 @@ public static class PosEstimator
             return approximate_position;
         }
 
-        float base_score = ScorePose(measurements, approximate_position, lidar_offset);
+        if (distance_field == null)
+        {
+            BuildDistanceField();
+        }
+
+        PrepareScan(measurements);
+
+        SearchWorkspace workspace = new SearchWorkspace(measurements.Count);
+
+        System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
+
+        float base_score = ScorePose(measurements, approximate_position, lidar_offset, workspace);
 
         // --- Zooming coordinate-descent search ------------------------------
-        PoseEstimate best = Search(measurements, approximate_position, lidar_offset);
+        PoseEstimate best = Search(measurements, approximate_position, lidar_offset, workspace);
+
+        clock.Stop();
+        LastEstimateMs = clock.Elapsed.TotalMilliseconds;
+        LastSweepCount = workspace.sweeps_run;
 
         float best_x = best.x;
         float best_y = best.y;
@@ -203,9 +330,40 @@ public static class PosEstimator
     }
 
     /// <summary>
+    /// Bakes the per-ray invariants for one scan: the range in mm and the sine
+    /// and cosine of each ray's bearing. These depend only on the scan, not on
+    /// the candidate pose, but <see cref="ProjectScan"/> runs many times per
+    /// estimate, so recomputing them there was pure waste.
+    /// </summary>
+    private static void PrepareScan(List<Lidar.Measurement> measurements)
+    {
+        int count = measurements.Count;
+
+        if (scan_cos == null || scan_cos.Length != count)
+        {
+            scan_cos = new float[count];
+            scan_sin = new float[count];
+            scan_range_mm = new float[count];
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            float angle_rad = measurements[i].angle * Mathf.Deg2Rad;
+
+            scan_cos[i] = Mathf.Cos(angle_rad);
+            scan_sin[i] = Mathf.Sin(angle_rad);
+            scan_range_mm[i] = measurements[i].distance * 1000f;
+        }
+    }
+
+    /// <summary>
     /// Projects the scan from a candidate robot pose into field coordinates.
     /// The lidar sits at an offset from the robot's centre, so that offset is
     /// rotated by the candidate heading before the rays are cast.
+    ///
+    /// Each ray's range in mm and the sine/cosine of its own bearing are baked
+    /// once per scan by <see cref="PrepareScan"/>, so this loop is only the
+    /// per-pose rotation and translation.
     /// </summary>
     private static Vector2[] ProjectScan(
         List<Lidar.Measurement> measurements,
@@ -213,34 +371,59 @@ public static class PosEstimator
         Pos lidar_offset,
         Vector2[] buffer)
     {
-        float cos_a = Mathf.Cos(pose.pos_a * Mathf.Deg2Rad);
-        float sin_a = Mathf.Sin(pose.pos_a * Mathf.Deg2Rad);
+        float a_rad = pose.pos_a * Mathf.Deg2Rad;
+        float cos_a = Mathf.Cos(a_rad);
+        float sin_a = Mathf.Sin(a_rad);
 
         // Lidar origin in field coordinates.
         float origin_x = pose.pos_x + lidar_offset.pos_x * cos_a - lidar_offset.pos_y * sin_a;
         float origin_y = pose.pos_y + lidar_offset.pos_x * sin_a + lidar_offset.pos_y * cos_a;
 
+        // Rotating each ray by the pose is a single complex multiply against the
+        // precomputed bearing, so no per-ray trig remains here.
         for (int i = 0; i < measurements.Count; i++)
         {
-            float range_mm = measurements[i].distance * 1000f;
-            float angle_rad = (pose.pos_a + measurements[i].angle) * Mathf.Deg2Rad;
+            float local_x = scan_cos[i];
+            float local_y = scan_sin[i];
+            float range_mm = scan_range_mm[i];
 
             buffer[i] = new Vector2(
-                origin_x + range_mm * Mathf.Cos(angle_rad),
-                origin_y + range_mm * Mathf.Sin(angle_rad));
+                origin_x + range_mm * (local_x * cos_a - local_y * sin_a),
+                origin_y + range_mm * (local_x * sin_a + local_y * cos_a));
         }
 
         return buffer;
     }
 
-    /// <summary>Scores the scan projected from a candidate robot pose.</summary>
+    /// <summary>
+    /// Scores the scan projected from a candidate robot pose.
+    /// </summary>
     private static float ScorePose(
         List<Lidar.Measurement> measurements,
         Pos pose,
-        Pos lidar_offset)
+        Pos lidar_offset,
+        SearchWorkspace workspace)
     {
-        Vector2[] buffer = new Vector2[measurements.Count];
-        return ScoreProjected(ProjectScan(measurements, pose, lidar_offset, buffer));
+        ProjectScan(measurements, pose, lidar_offset, workspace.base_points);
+        return ScoreProjected(workspace.base_points);
+    }
+
+    /// <summary>
+    /// Mean Gaussian distance-to-wall score over every projected point. The
+    /// falloff is smooth, so the score has a gradient pointing toward the
+    /// correct pose instead of a hard inlier cliff.
+    /// </summary>
+    private static float ScoreProjected(Vector2[] points)
+    {
+        float score = 0f;
+        int count = points.Length;
+
+        for (int i = 0; i < count; i++)
+        {
+            score += PointScore(SampleDistanceField(points[i].x, points[i].y));
+        }
+
+        return count > 0 ? score / count : 0f;
     }
 
     /// <summary>Outcome of one search schedule.</summary>
@@ -257,6 +440,9 @@ public static class PosEstimator
     {
         // Projected scan for the best pose found so far.
         public readonly Vector2[] base_points;
+
+        /// <summary>Sweeps the last search actually ran, for diagnostics.</summary>
+        public int sweeps_run;
 
         public SearchWorkspace(int rays)
         {
@@ -277,22 +463,22 @@ public static class PosEstimator
     /// 3*(2*POINTS_PER_SWEEP+1) pose evaluations regardless of how coarse or
     /// fine it is.
     ///
-    /// The range is clamped to a floor so the step never collapses to zero and
-    /// the search keeps making progress until TOTAL_STEPS is exhausted.
+    /// The range is clamped to a floor so the step never collapses to zero.
+    /// TOTAL_STEPS sweeps always run; there is no early exit, so the cost is
+    /// constant and the zoom is guaranteed to reach its narrowest step.
     /// </summary>
     private static PoseEstimate Search(
         List<Lidar.Measurement> measurements,
         Pos centre,
-        Pos lidar_offset)
+        Pos lidar_offset,
+        SearchWorkspace workspace)
     {
-        SearchWorkspace workspace = new SearchWorkspace(measurements.Count);
-
         PoseEstimate best = new PoseEstimate
         {
             x = centre.pos_x,
             y = centre.pos_y,
             a = centre.pos_a,
-            score = ScorePose(measurements, centre, lidar_offset),
+            score = ScorePose(measurements, centre, lidar_offset, workspace),
         };
 
         float range_mm = RANGE_MM;
@@ -300,8 +486,6 @@ public static class PosEstimator
 
         for (int step_index = 0; step_index < TOTAL_STEPS; step_index++)
         {
-            float sweep_start_score = best.score;
-
             float xy_step = range_mm / POINTS_PER_SWEEP;
             float angle_step = range_deg / POINTS_PER_SWEEP;
 
@@ -309,16 +493,11 @@ public static class PosEstimator
             SweepX(measurements, lidar_offset, workspace, POINTS_PER_SWEEP, xy_step, ref best);
             SweepY(measurements, lidar_offset, workspace, POINTS_PER_SWEEP, xy_step, ref best);
 
-            float gain = best.score - sweep_start_score;
+            workspace.sweeps_run = step_index + 1;
 
             // Zoom in on the peak, never below the smallest useful range.
             range_mm = Mathf.Max(MIN_RANGE_MM, range_mm * ZOOM_FACTOR);
             range_deg = Mathf.Max(MIN_ANGLE_RANGE_DEG, range_deg * ZOOM_FACTOR);
-
-            if (gain < SWEEP_CONVERGENCE_EPSILON)
-            {
-                break;
-            }
         }
 
         return best;
@@ -356,7 +535,7 @@ public static class PosEstimator
                 Vector2 point = workspace.base_points[i];
                 point.x += x;
 
-                score += PointScore(DistanceToNearestWall(point, out _, out _));
+                score += PointScore(SampleDistanceField(point.x, point.y));
             }
 
             score /= workspace.base_points.Length;
@@ -400,7 +579,7 @@ public static class PosEstimator
             {
                 Vector2 point = workspace.base_points[i];
                 point.y += y;
-                score += PointScore(DistanceToNearestWall(point, out _, out _));
+                score += PointScore(SampleDistanceField(point.x, point.y));
             }
 
             score /= workspace.base_points.Length;
@@ -461,7 +640,7 @@ public static class PosEstimator
                     centre_x + offset_x * cos_d - offset_y * sin_d,
                     centre_y + offset_x * sin_d + offset_y * cos_d);
 
-                score += PointScore(DistanceToNearestWall(rotated, out _, out _));
+                score += PointScore(SampleDistanceField(rotated.x, rotated.y));
             }
 
             score /= workspace.base_points.Length;
@@ -485,23 +664,6 @@ public static class PosEstimator
     {
         float sigma = SCORE_SIGMA_MM;
         return Mathf.Exp(-(distance * distance) / (2f * sigma * sigma));
-    }
-
-    /// <summary>
-    /// Scores projected points by the mean Gaussian distance-to-wall score. The
-    /// falloff is smooth, so the score has a gradient pointing toward the
-    /// correct pose instead of a hard inlier cliff.
-    /// </summary>
-    private static float ScoreProjected(Vector2[] points)
-    {
-        float score = 0f;
-
-        for (int i = 0; i < points.Length; i++)
-        {
-            score += PointScore(DistanceToNearestWall(points[i], out _, out _));
-        }
-
-        return points.Length > 0 ? score / points.Length : 0f;
     }
 
     /// <summary>

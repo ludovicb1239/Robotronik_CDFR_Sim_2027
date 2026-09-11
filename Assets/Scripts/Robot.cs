@@ -38,7 +38,7 @@ public class Robot : MonoBehaviour
             // unity_z is estimator Y.
             float unity_yaw = transform.eulerAngles.y;
 
-            // A full revolution is done: lidar.measurements is ready to process.
+            // A full scan has just been produced: lidar.measurements is ready.
             Pos approximate_position = new Pos
             {
                 pos_x = transform.position.x * 1000f + Random.Range(-position_noise_mm, position_noise_mm),
@@ -56,14 +56,23 @@ public class Robot : MonoBehaviour
                 pos_a = -unity_yaw,
             };
 
-            Debug.Log($"PosEstimator: error " +
-                      $"({approximate_position.pos_x - real_position.pos_x:F0}, " +
-                      $"{approximate_position.pos_y - real_position.pos_y:F0}, " +
-                      $"{approximate_position.pos_a - real_position.pos_a:F1}) " +
-                      $"-> residual " +
-                      $"({estimated_position.pos_x - real_position.pos_x:F0}, " +
-                      $"{estimated_position.pos_y - real_position.pos_y:F0}, " +
-                      $"{estimated_position.pos_a - real_position.pos_a:F1})");
+            float residual_x = estimated_position.pos_x - real_position.pos_x;
+            float residual_y = estimated_position.pos_y - real_position.pos_y;
+            float residual_a = estimated_position.pos_a - real_position.pos_a;
+
+            float residual_distance = Mathf.Sqrt(residual_x * residual_x + residual_y * residual_y);
+
+            if (residual_distance > 5f || Mathf.Abs(residual_a) > 0.5f)
+            {
+                Debug.LogWarning($"Could not find exact position: error " +
+                                 $"({approximate_position.pos_x - real_position.pos_x:F0}, " +
+                                 $"{approximate_position.pos_y - real_position.pos_y:F0}, " +
+                                 $"{approximate_position.pos_a - real_position.pos_a:F1}) " +
+                                 $"-> residual " +
+                                 $"({residual_x:F0}, {residual_y:F0}, {residual_a:F1}) | " +
+                                 $"{PosEstimator.LastEstimateMs:F1} ms, " +
+                                 $"{PosEstimator.LastSweepCount} sweeps");
+            }
 
             lidar.BeginSweep();
         }

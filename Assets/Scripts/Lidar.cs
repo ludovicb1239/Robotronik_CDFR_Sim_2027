@@ -12,18 +12,16 @@ public class Lidar : MonoBehaviour
     }
 
     [SerializeField] private float spinning_frequency_hz = 10f; // Hz
-    [SerializeField] private float ray_frequency_hz = 100f;     // Hz
+    [SerializeField, Min(1)] private int rays_per_scan = 330;   // rays per full revolution
     [SerializeField] private float sensor_precision_mm = 5f;    // +/- error in mm
     [SerializeField] private LayerMask ignore_hitbox_mask;      // hit, drawn, but not measured
     [SerializeField] private LineRenderer lineRenderer;
     private List<Vector3> hit_positions = new List<Vector3>();
 
-    // (angle in degrees, distance in meters) measured this revolution
+    // (angle in degrees, distance in meters) measured this scan
     public List<Measurement> measurements = new List<Measurement>();
 
-    private float current_angle = 0f;
-    private float degrees_per_ray = 0f;
-    private float ray_accumulator = 0f;
+    private float scan_accumulator = 0f;
 
     private void Awake()
     {
@@ -42,49 +40,56 @@ public class Lidar : MonoBehaviour
     }
 
     /// <summary>Advances the lidar by one frame. Called by the robot controlling it.</summary>
-    /// <returns>True when <see cref="measurements"/> has just been filled (end of a revolution).</returns>
+    /// <returns>True when <see cref="measurements"/> has just been filled (one complete scan).</returns>
     public bool UpdateLidar()
     {
-        bool revolution_complete = false;
+        // The lidar spins at a fixed rate but a full scan is produced in a single
+        // step: the whole revolution is cast at once rather than accumulated ray
+        // by ray, so a scan is instantaneous when it happens.
+        scan_accumulator += Time.deltaTime * spinning_frequency_hz;
 
-        ray_accumulator += Time.deltaTime * ray_frequency_hz;
-
-        while (ray_accumulator >= 1f)
+        if (scan_accumulator < 1f)
         {
-            ray_accumulator -= 1f;
-
-            current_angle += degrees_per_ray;
-
-            if (current_angle >= 360f)
-            {
-                current_angle -= 360f;
-                revolution_complete = true;
-            }
-
-            CastRay();
+            return false;
         }
 
-        transform.localRotation = Quaternion.Euler(0f, current_angle, 0f);
-        UpdateLineRenderer();
+        scan_accumulator -= 1f;
 
-        return revolution_complete;
+        CastScan();
+        return true;
     }
 
     public void BeginSweep()
     {
-        float rays_per_revolution = Mathf.Max(1f, ray_frequency_hz / spinning_frequency_hz);
-        degrees_per_ray = 360f / rays_per_revolution;
-
         hit_positions.Clear();
         measurements.Clear();
-        current_angle = 0f;
-        ray_accumulator = 0f;
+        scan_accumulator = 0f;
     }
 
-    private void CastRay()
+    /// <summary>
+    /// Casts every ray of one full revolution at once. The beams are spread
+    /// evenly over 360 degrees, so the scan is a complete, self-consistent
+    /// snapshot of the field at this instant.
+    /// </summary>
+    private void CastScan()
+    {
+        hit_positions.Clear();
+        measurements.Clear();
+
+        float degrees_per_ray = 360f / Mathf.Max(1, rays_per_scan);
+
+        for (int i = 0; i < rays_per_scan; i++)
+        {
+            CastRay(i * degrees_per_ray);
+        }
+
+        UpdateLineRenderer();
+    }
+
+    private void CastRay(float angle_degrees)
     {
         Vector3 origin = transform.position;
-        Quaternion spin = Quaternion.Euler(0f, current_angle, 0f);
+        Quaternion spin = Quaternion.Euler(0f, angle_degrees, 0f);
         Vector3 direction = transform.parent != null
             ? transform.parent.TransformDirection(spin * Vector3.forward)
             : spin * transform.forward;
@@ -109,7 +114,7 @@ public class Lidar : MonoBehaviour
 
             // Reported in the consumer's frame: X forward, Y left, angles CCW,
             // which is the opposite sense to Unity's yaw about +Y.
-            measurements.Add(new Measurement { angle = -current_angle, distance = measured_distance });
+            measurements.Add(new Measurement { angle = -angle_degrees, distance = measured_distance });
         }
     }
 
