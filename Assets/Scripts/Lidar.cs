@@ -125,7 +125,149 @@ public class Lidar : MonoBehaviour
             CastRay(i * degrees_per_ray);
         }
 
+        RemoveOccludedRays();
+
         UpdateLineRenderer();
+    }
+
+    /// <summary>
+    /// Drops rays that hit an occluding obstacle rather than a wall, by
+    /// classifying the scan in both directions and removing only the rays that
+    /// both classifications reject.
+    ///
+    /// Walking the scan in bearing order, a sudden drop in range means the beam
+    /// has just landed on something nearer than whatever it was hitting before -
+    /// an obstacle blocking the view. A sudden rise back out means the beam has
+    /// cleared that obstacle's edge. The run of rays between the two is the
+    /// occluded span, and it covers both the obstacle's own front face and the
+    /// shadow it casts behind itself.
+    ///
+    /// The difficulty is deciding which side of a jump is the occluder and which
+    /// is the wall, because that depends on the scan's direction of travel. Walk
+    /// the rays forwards and the run that follows a drop looks occluded; walk
+    /// them backwards and the run that precedes that same drop looks occluded
+    /// instead. A range-only rule cannot tell a real obstacle edge from a convex
+    /// corner of the field itself, where the range legitimately drops with
+    /// nothing occluding it, so a forwards-only rule can eat good corner
+    /// geometry - exactly the features that pin down the pose.
+    ///
+    /// Requiring both directions to agree removes that ambiguity. A ray is
+    /// discarded only when the forwards pass and the backwards pass both place it
+    /// inside an occluded span. At a concave obstacle, both passes agree and it is
+    /// removed. At a convex corner, the two passes disagree, so the geometry is
+    /// kept and the filter stays conservative - it drops less than a
+    /// single-direction rule, and what it does drop is much less likely to be
+    /// genuine wall.
+    ///
+    /// Applied once per scan, before the line renderer runs, so what is drawn and
+    /// what is reported always agree. Thresholds are hardcoded for now. JUMP_MM
+    /// is well above the sensor's own 5 mm range noise, so noise on a flat wall
+    /// is not mistaken for an edge, while a real obstacle edge moves the range by
+    /// hundreds of mm.
+    /// </summary>
+    private void RemoveOccludedRays()
+    {
+        const float JUMP_MM = 50f;
+
+        int count = measurements.Count;
+
+        if (count < 3)
+        {
+            return;
+        }
+
+        // Work in millimetres, since the tolerance is specified that way.
+        float[] ranges_mm = new float[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            ranges_mm[i] = measurements[i].distance * 1000f;
+        }
+
+        // Forward pass: a ray is occluded when the nearest preceding sharp move
+        // was a drop rather than a rise.
+        bool[] occluded_forward = new bool[count];
+        bool occluded = false;
+
+        for (int i = 1; i < count; i++)
+        {
+            float delta = ranges_mm[i] - ranges_mm[i - 1];
+
+            if (delta < -JUMP_MM)
+            {
+                occluded = true;
+            }
+            else if (delta > JUMP_MM)
+            {
+                occluded = false;
+            }
+
+            occluded_forward[i] = occluded;
+        }
+
+        // Backward pass: the same walk in the opposite direction. Starting from
+        // the other end makes each span's boundary the opposite kind of jump, so
+        // the two passes disagree wherever a jump is not a real occlusion.
+        bool[] occluded_backward = new bool[count];
+        occluded = false;
+
+        for (int i = count - 2; i >= 0; i--)
+        {
+            float delta = ranges_mm[i] - ranges_mm[i + 1];
+
+            if (delta < -JUMP_MM)
+            {
+                occluded = true;
+            }
+            else if (delta > JUMP_MM)
+            {
+                occluded = false;
+            }
+
+            occluded_backward[i] = occluded;
+        }
+
+        // Keep a ray unless both passes agree that it is occluded.
+        bool[] keep = new bool[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            keep[i] = !(occluded_forward[i] && occluded_backward[i]);
+        }
+
+        // Rebuild both parallel lists from the surviving rays, so the drawn
+        // points and the reported measurements cannot drift apart.
+        int write = 0;
+
+        for (int i = 0; i < count; i++)
+        {
+            if (!keep[i])
+            {
+                continue;
+            }
+
+            if (write != i)
+            {
+                measurements[write] = measurements[i];
+
+                if (i < hit_positions.Count)
+                {
+                    hit_positions[write] = hit_positions[i];
+                }
+            }
+
+            write++;
+        }
+
+        if (write < measurements.Count)
+        {
+            measurements.RemoveRange(write, measurements.Count - write);
+        }
+
+        if (write < hit_positions.Count)
+        {
+            hit_positions.RemoveRange(write, hit_positions.Count - write);
+        }
     }
 
     private void CastRay(float angle_degrees)
