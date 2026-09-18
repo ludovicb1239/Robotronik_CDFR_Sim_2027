@@ -23,6 +23,40 @@ public class Lidar : MonoBehaviour
 
     private float scan_accumulator = 0f;
 
+    // Box-Muller produces two independent standard normals per call; the spare
+    // is kept here so the second one is not thrown away.
+    private bool has_spare_gaussian;
+    private float spare_gaussian;
+
+    /// <summary>
+    /// Draws a zero-mean Gaussian with the given standard deviation.
+    ///
+    /// Box-Muller: two uniform draws map to a radius and an angle, and the
+    /// resulting point has independent normal components. The cosine and sine
+    /// terms are two separate draws, so caching one halves the transcendental
+    /// work per scan ray.
+    /// </summary>
+    private float Gaussian(float standard_deviation)
+    {
+        if (has_spare_gaussian)
+        {
+            has_spare_gaussian = false;
+            return spare_gaussian * standard_deviation;
+        }
+
+        // u1 must stay strictly above zero because the radius takes its log.
+        float u1 = 1f - Random.value;
+        float u2 = Random.value;
+
+        float radius = Mathf.Sqrt(-2f * Mathf.Log(u1));
+        float angle = 2f * Mathf.PI * u2;
+
+        spare_gaussian = radius * Mathf.Sin(angle);
+        has_spare_gaussian = true;
+
+        return radius * Mathf.Cos(angle) * standard_deviation;
+    }
+
     private void Awake()
     {
         if (lineRenderer == null)
@@ -70,6 +104,14 @@ public class Lidar : MonoBehaviour
     /// Casts every ray of one full revolution at once. The beams are spread
     /// evenly over 360 degrees, so the scan is a complete, self-consistent
     /// snapshot of the field at this instant.
+    ///
+    /// Scans are strictly one shot: each revolution is cast in a single step at
+    /// a single instant and replaces the previous measurements, so no scan is
+    /// ever accumulated from rays captured at different times. That is what
+    /// makes the geometric model exact - every ray in a scan shares one robot
+    /// pose, and the pose the estimator recovers is the pose at the moment of
+    /// the cast. There is no motion distortion and no scan-matching between
+    /// successive scans to account for.
     /// </summary>
     private void CastScan()
     {
@@ -103,8 +145,18 @@ public class Lidar : MonoBehaviour
             ignored = (ignore_hitbox_mask.value & (1 << hit.collider.gameObject.layer)) != 0;
         }
 
-        // Randomise the measured distance by +/- sensor_precision_mm.
-        float noise_m = Random.Range(-sensor_precision_mm, sensor_precision_mm) * 0.001f;
+        // Randomise the measured distance with Gaussian noise whose standard
+        // deviation is sensor_precision_mm. A uniform draw over
+        // +/- sensor_precision_mm has standard deviation precision/sqrt(3), so
+        // it would misrepresent a real sensor: distance noise is the sum of
+        // many small independent effects and is therefore bell shaped, not
+        // flat. Matching the estimator's Gaussian likelihood to the noise the
+        // simulator actually injects keeps the two consistent and stops the
+        // model from being systematically over- or under-confident.
+        //
+        // Gaussian tails are unbounded, so the result is clamped to the
+        // physically sensible range instead of allowing a negative range.
+        float noise_m = Gaussian(sensor_precision_mm) * 0.001f;
         float measured_distance = Mathf.Clamp(distance + noise_m, 0f, 100f);
 
         // Ignored hitboxes are drawn but never reported as a measurement.

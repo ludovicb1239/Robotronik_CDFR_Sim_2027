@@ -9,10 +9,14 @@ using UnityEngine;
 /// Convention: X is forward, 0 deg points along +X, Y is left, 90 deg points
 /// along +Y. Angles are counter-clockwise.
 ///
-/// Scoring: each ray scores exp(-d^2 / 2*sigma^2) against the distance d from
-/// its hit point to the nearest field wall, and the pose score is the mean over
-/// rays. There is no plateau and no cutoff, so the score is smooth everywhere
-/// and every ray contributes to the gradient.
+/// Scoring: each ray scores a robust kernel of the distance d from its hit
+/// point to the nearest field wall, and the pose score is the mean over rays.
+/// The kernel is 1 on a wall and decays smoothly, so a point near a wall
+/// carries strong positional information while a point far from every wall -
+/// which is what an obstacle return looks like - contributes a small, bounded
+/// pull rather than either a hard zero or an outsized vote. Crucially it never
+/// becomes exactly flat, so the search always has a gradient to follow even
+/// when the whole scan starts well away from the walls.
 ///
 /// Algorithm: zooming coordinate-descent scan matching. Instead of scoring the
 /// whole (dx, dy, da) box, the search sweeps one axis at a time - heading, then
@@ -30,16 +34,21 @@ using UnityEngine;
 /// candidate is a cheap translation or rotation of those points.
 ///
 /// The inner loop is kept cheap by three things, in order of impact:
-/// 1. distance-to-wall comes from a baked distance field (a bilinear lookup)
-///    instead of a walk over every wall segment;
-/// 2. each ray's range and bearing are baked once per scan, so projection
-///    carries no per-ray trigonometry;
-/// 3. the score is a plain Gaussian, which the compiler turns into a single
-///    multiply and an Exp.
+/// 1. the field has only eight boundary segments, so the exact distance from a
+///    point to the nearest wall is eight clamped projections - cheap enough
+///    that no baked distance field or spatial index is needed, and exact rather
+///    than quantised and interpolated;
+/// 2. each ray's range and bearing are baked once per scan, so projecting the
+///    scan carries no per-ray trigonometry and each candidate pose is a single
+///    rotation and translation of the already-computed bearing;
+/// 3. the score is a bounded rational kernel, which the compiler turns into a
+///    multiply-add, a divide and no transcendental call at all.
 ///
-/// Note: scoring every ray matters for correctness, not just cost. Rays that hit
-/// obstacles are repeatable features, and dropping them leaves the search with
-/// too few constraints, which lets it drift. Obstacle rays are therefore kept.
+/// Note on obstacle rays: they are deliberately still scored, not filtered out.
+/// Filtering them was tried and regressed, because an obstacle return is a
+/// repeatable feature rather than noise and dropping it starves a 3-DOF fit of
+/// constraints. The robust kernel achieves the useful part of that idea - far
+/// points stop steering the search - without the cost of deleting evidence.
 /// </summary>
 public static class PosEstimator
 {
@@ -50,42 +59,88 @@ public static class PosEstimator
         new Vector2(  1000f,-1500f),
         new Vector2( -1000f,-1500f),
         new Vector2( -1000f, -900f),
-        new Vector2(  -545f, -900f),
-        new Vector2(  -545f,  900f),
+        new Vector2(  -550f, -900f),
+        new Vector2(  -550f,  900f),
         new Vector2( -1000f,  900f),
         new Vector2( -1000f, 1500f),
     };
 
     /// <summary>Falloff of the score with distance from a wall, in mm.</summary>
-    private const float SCORE_SIGMA_MM = 20f;
-
-    // --- Distance field ----------------------------------------------------
-    /// <summary>
-    /// Cell size of the baked distance-to-nearest-wall grid, in mm. The field is
-    /// sampled bilinearly, so the error is a small fraction of a cell; 2 mm
-    /// keeps it far below the lidar's own precision while staying cache friendly.
-    /// </summary>
-    private const float FIELD_CELL_MM = 2f;
-
-    /// <summary>Half-extent of the baked grid, covering the field plus a margin, in mm.</summary>
-    private const float FIELD_HALF_MM = 2000f;
-
-    /// <summary>Number of cells along each axis of the distance field.</summary>
-    private const int FIELD_SIZE = 2001; // 2*FIELD_HALF_MM / FIELD_CELL_MM + 1
+    private const float SCORE_SIGMA_MM = 10f;
 
     /// <summary>
-    /// Distance from every grid node to the nearest wall, in tenths of a
-    /// millimetre. Stored as short rather than float to halve the working set:
-    /// 0.1 mm quantisation is far below the 0.5 mm target and the field is
-    /// sampled millions of times, so cache residency matters.
+    /// Scale at which the score stops falling appreciably, in mm.
+    ///
+    /// A plain Gaussian keeps decreasing forever, so a projected point that
+    /// sits on an obstacle far from every wall scores almost exactly zero and
+    /// drags the mean down from the correct pose toward whatever pose happens
+    /// to push obstacle returns onto walls. The score therefore has to become
+    /// insensitive to distance out there, so that obstacle returns stop
+    /// steering the search.
+    ///
+    /// The insensitivity is achieved by softening the Gaussian into a robust
+    /// kernel rather than by clamping the distance. Clamping was tried and was
+    /// a regression: it makes the score exactly flat beyond the clamp, so a ray
+    /// already past it contributes no gradient at all, and the search can only
+    /// escape such a plateau if some other ray happens to still be inside the
+    /// clamp radius. With a prior of +/-75 mm and a 60 mm clamp, roughly half of
+    /// all scans started with every wall ray already flat, and those scans
+    /// simply kept the prior - which is the loss of precision this kernel fixes.
+    ///
+    /// The kernel below is a Geman-McClure form. It falls off like a Gaussian
+    /// near a wall, where the positional information lives, but its tails decay
+    /// only quadratically, so a far point contributes a small, monotonically
+    /// decreasing pull toward the wall instead of a constant. There is no region
+    /// of exactly zero gradient, so the search always has a direction to move.
+    /// The influence of a far point is bounded well below that of a wall point,
+    /// which is what keeps obstacle returns from dominating the fit.
     /// </summary>
-    private static short[] distance_field;
+    private const float SCORE_ROLLOFF_MM = 2.5f * SCORE_SIGMA_MM;
 
-    /// <summary>Scale from the stored short back to millimetres.</summary>
-    private const float FIELD_UNIT_MM = 0.1f;
+    // --- Field geometry ----------------------------------------------------
+    /// <summary>
+    /// The boundary segments, flattened into parallel arrays so the distance
+    /// walk can move along them without an indirection back through the
+    /// polygon's vertex list or a modulo to find the wrap-around edge.
+    ///
+    /// This replaces the baked distance-to-nearest-wall grid. The grid bought
+    /// speed by turning a walk over the segments into a bilinear lookup, but it
+    /// paid for that with a 2001x2001 short array (about 7.6 MB), a one-off
+    /// bake, a 0.1 mm quantisation, and an interpolation error of a fraction of
+    /// a 2 mm cell. None of that is necessary: there are only eight segments, so
+    /// exact geometry is a handful of arithmetic per segment and is both easier
+    /// to reason about and exactly correct, with no quantisation and no
+    /// interpolation error anywhere.
+    /// </summary>
+    private static readonly Vector2[] segment_start;
+    private static readonly Vector2[] segment_edge;
+    private static readonly float[] segment_length_squared;
 
-    /// <summary>What the distance field is evaluated to at least, in mm.</summary>
-    private const float FIELD_MAX_DISTANCE_MM = 500f;
+    /// <summary>
+    /// Fills the flattened segment tables from <see cref="FIELD_OUTLINE"/>. The
+    /// polygon's last vertex is wired back to the first, so the closing edge is
+    /// present in the table like any other and the distance walk needs no
+    /// wrap-around special case.
+    /// </summary>
+    static PosEstimator()
+    {
+        int count = FIELD_OUTLINE.Length;
+
+        segment_start = new Vector2[count];
+        segment_edge = new Vector2[count];
+        segment_length_squared = new float[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            Vector2 a = FIELD_OUTLINE[i];
+            Vector2 b = FIELD_OUTLINE[(i + 1) % count];
+            Vector2 edge = b - a;
+
+            segment_start[i] = a;
+            segment_edge[i] = edge;
+            segment_length_squared[i] = edge.sqrMagnitude;
+        }
+    }
 
     // Per-ray invariants for the current scan, baked by PrepareScan.
     private static float[] scan_cos;
@@ -146,113 +201,50 @@ public static class PosEstimator
     public static int LastSweepCount { get; private set; }
 
     /// <summary>
-    /// Bakes the distance-to-nearest-wall field. Called once, lazily, before the
-    /// first estimate. Each node stores the clamped distance so the far field
-    /// saturates instead of growing without bound - beyond
-    /// FIELD_MAX_DISTANCE_MM the exact value never affects the score.
+    /// Distance from a point to the nearest field wall segment, clamped to the
+    /// segment ends, by walking all eight boundary edges.
+    ///
+    /// This is exact, unlike the interpolated lookup it replaces. It is called
+    /// once per ray per candidate pose, so it is the hot path; eight segment
+    /// projections is small enough that no acceleration structure is warranted,
+    /// and keeping it exact removes the quantisation and interpolation error the
+    /// baked field carried while also dropping the multimegabyte array.
     /// </summary>
-    private static void BuildDistanceField()
+    private static float DistanceToNearestWall(Vector2 point)
     {
-        short[] field = new short[FIELD_SIZE * FIELD_SIZE];
+        float best_distance_squared = float.MaxValue;
 
-        for (int iy = 0; iy < FIELD_SIZE; iy++)
+        for (int i = 0; i < segment_start.Length; i++)
         {
-            float y = -FIELD_HALF_MM + iy * FIELD_CELL_MM;
+            float ex = segment_edge[i].x;
+            float ey = segment_edge[i].y;
 
-            for (int ix = 0; ix < FIELD_SIZE; ix++)
-            {
-                float x = -FIELD_HALF_MM + ix * FIELD_CELL_MM;
+            float ax = point.x - segment_start[i].x;
+            float ay = point.y - segment_start[i].y;
 
-                float distance = DistanceToNearestWall(new Vector2(x, y), out _, out _);
-                distance = Mathf.Min(distance, FIELD_MAX_DISTANCE_MM);
+            // Project onto the segment and clamp to its ends, so the distance is
+            // measured to the wall itself and not to its infinite extension.
+            float length_squared = segment_length_squared[i];
 
-                field[iy * FIELD_SIZE + ix] = (short)Mathf.RoundToInt(distance / FIELD_UNIT_MM);
-            }
-        }
-
-        distance_field = field;
-    }
-
-    /// <summary>
-    /// Distance to the nearest wall at a point, in mm, by bilinear interpolation
-    /// of the baked field. This is the hot path: it replaces a loop over every
-    /// wall segment with four loads and a handful of multiplies.
-    /// </summary>
-    private static float SampleDistanceField(float x, float y)
-    {
-        float fx = (x + FIELD_HALF_MM) / FIELD_CELL_MM;
-        float fy = (y + FIELD_HALF_MM) / FIELD_CELL_MM;
-
-        // Outside the baked grid: clamp to the border, whose value is the
-        // saturated distance, so the score is uniformly zero out there.
-        if (fx <= 0f || fy <= 0f || fx >= FIELD_SIZE - 1 || fy >= FIELD_SIZE - 1)
-        {
-            return FIELD_MAX_DISTANCE_MM;
-        }
-
-        int ix = (int)fx;
-        int iy = (int)fy;
-
-        float tx = fx - ix;
-        float ty = fy - iy;
-
-        int row = iy * FIELD_SIZE + ix;
-
-        // Interpolate in the stored units, then scale once at the end.
-        float d00 = distance_field[row];
-        float d10 = distance_field[row + 1];
-        float d01 = distance_field[row + FIELD_SIZE];
-        float d11 = distance_field[row + FIELD_SIZE + 1];
-
-        // Bilinear blend; the compiler vectorises the fixed mixes.
-        float top = d00 + (d10 - d00) * tx;
-        float bottom = d01 + (d11 - d01) * tx;
-
-        return (top + (bottom - top) * ty) * FIELD_UNIT_MM;
-    }
-
-    /// <summary>
-    /// Distance from a point to a field wall segment, clamped to the segment ends.
-    /// Also returns the wall's direction and normal. This is the exact routine,
-    /// used only to bake the distance field.
-    /// </summary>
-    private static float DistanceToNearestWall(Vector2 point, out Vector2 wall_direction, out Vector2 wall_normal)
-    {
-        float best_distance = float.MaxValue;
-        wall_direction = Vector2.right;
-        wall_normal = Vector2.up;
-
-        for (int i = 0; i < FIELD_OUTLINE.Length; i++)
-        {
-            Vector2 a = FIELD_OUTLINE[i];
-            Vector2 b = FIELD_OUTLINE[(i + 1) % FIELD_OUTLINE.Length];
-
-            Vector2 edge = b - a;
-            float edge_length = edge.magnitude;
-
-            if (edge_length < Mathf.Epsilon)
+            if (length_squared <= 0f)
             {
                 continue;
             }
 
-            Vector2 direction = edge / edge_length;
-            Vector2 normal = new Vector2(-direction.y, direction.x);
+            float t = (ax * ex + ay * ey) / length_squared;
+            t = t < 0f ? 0f : (t > 1f ? 1f : t);
 
-            // Project onto the segment, clamped to its ends, so the distance is
-            // measured to the wall itself and not to its infinite extension.
-            float t = Mathf.Clamp(Vector2.Dot(point - a, direction) / edge_length, 0f, 1f);
-            Vector2 closest = a + direction * (t * edge_length);
-            float distance = Vector2.Distance(point, closest);
+            float dx = ax - t * ex;
+            float dy = ay - t * ey;
+            float distance_squared = dx * dx + dy * dy;
 
-            if (distance < best_distance)
+            if (distance_squared < best_distance_squared)
             {
-                best_distance = distance;
-                wall_direction = direction;
-                wall_normal = normal;
+                best_distance_squared = distance_squared;
             }
         }
 
-        return best_distance;
+        return Mathf.Sqrt(best_distance_squared);
     }
 
     /// <summary>
@@ -279,11 +271,6 @@ public static class PosEstimator
         {
             Reject("scan produced fewer than 2 points");
             return approximate_position;
-        }
-
-        if (distance_field == null)
-        {
-            BuildDistanceField();
         }
 
         PrepareScan(measurements);
@@ -409,9 +396,16 @@ public static class PosEstimator
     }
 
     /// <summary>
-    /// Mean Gaussian distance-to-wall score over every projected point. The
-    /// falloff is smooth, so the score has a gradient pointing toward the
-    /// correct pose instead of a hard inlier cliff.
+    /// Mean score over every projected point, where a point's score is the
+    /// robust kernel of the distance from that point to the nearest wall.
+    ///
+    /// The distance is measured to the nearest of the eight boundary segments,
+    /// found by walking them, which is exact where the baked distance field used
+    /// to interpolate. Note that this is a point-to-wall distance, not a
+    /// comparison of measured and predicted range: the two agree only when the
+    /// ray truly terminated on a wall. For an obstacle return they differ, which
+    /// is deliberate - the kernel makes such a point contribute a small bounded
+    /// pull rather than pretending the wall was closer than it is.
     /// </summary>
     private static float ScoreProjected(Vector2[] points)
     {
@@ -420,7 +414,7 @@ public static class PosEstimator
 
         for (int i = 0; i < count; i++)
         {
-            score += PointScore(SampleDistanceField(points[i].x, points[i].y));
+            score += PointScore(DistanceToNearestWall(points[i]));
         }
 
         return count > 0 ? score / count : 0f;
@@ -535,7 +529,7 @@ public static class PosEstimator
                 Vector2 point = workspace.base_points[i];
                 point.x += x;
 
-                score += PointScore(SampleDistanceField(point.x, point.y));
+                score += PointScore(DistanceToNearestWall(point));
             }
 
             score /= workspace.base_points.Length;
@@ -553,8 +547,8 @@ public static class PosEstimator
 
     /// <summary>
     /// Sweeps Y with X and the heading fixed, again by translating the scan.
-    /// Every ray is evaluated per candidate; the score has no cutoff, so even a
-    /// far ray still contributes a small amount and cannot be skipped.
+    /// Every ray is evaluated per candidate, because the mean is taken over the
+    /// full ray count and every ray contributes some gradient.
     /// </summary>
     private static void SweepY(
         List<Lidar.Measurement> measurements,
@@ -579,7 +573,7 @@ public static class PosEstimator
             {
                 Vector2 point = workspace.base_points[i];
                 point.y += y;
-                score += PointScore(SampleDistanceField(point.x, point.y));
+                score += PointScore(DistanceToNearestWall(point));
             }
 
             score /= workspace.base_points.Length;
@@ -599,9 +593,11 @@ public static class PosEstimator
     /// Sweeps the heading with X and Y fixed.
     ///
     /// Rotating the robot swings every ray, and the lidar offset makes each
-    /// projected point travel on an arc about the robot's centre. The score has
-    /// no plateau, so every point changes score under rotation and all rays are
-    /// evaluated per candidate.
+    /// projected point travel on an arc about the robot's centre. Points near a
+    /// wall change score fastest under rotation and so drive this sweep most,
+    /// but because the kernel never becomes flat every ray contributes some
+    /// gradient, which is what lets a scan that starts far from the walls still
+    /// rotate toward them.
     /// </summary>
     private static void SweepAngle(
         List<Lidar.Measurement> measurements,
@@ -640,7 +636,7 @@ public static class PosEstimator
                     centre_x + offset_x * cos_d - offset_y * sin_d,
                     centre_y + offset_x * sin_d + offset_y * cos_d);
 
-                score += PointScore(SampleDistanceField(rotated.x, rotated.y));
+                score += PointScore(DistanceToNearestWall(rotated));
             }
 
             score /= workspace.base_points.Length;
@@ -658,12 +654,31 @@ public static class PosEstimator
 
     /// <summary>
     /// Score contribution of a single point at a given distance from the nearest
-    /// wall: a plain Gaussian, maximal on the wall and never exactly zero.
+    /// wall, as a Geman-McClure robust kernel:
+    ///
+    ///     s(d) = rolloff^2 / (rolloff^2 + 2 * d^2)
+    ///
+    /// Near a wall this behaves like the Gaussian it replaces - it is 1 on the
+    /// wall, halves at about 0.64 * rolloff, and its sharpest slope sits a little
+    /// inside rolloff - so the positional information that locates the robot is
+    /// unchanged. Far from a wall it decays like 1/d^2 instead of collapsing to
+    /// exp(-large), which is the whole point: an obstacle return is far from
+    /// every wall, so it contributes a small, slowly-varying pull rather than a
+    /// hard zero, and it can never outvote the wall points that sit at distance
+    /// near zero and score near 1.
+    ///
+    /// Two properties matter for the search. First, the function is strictly
+    /// decreasing in d everywhere, with no flat region, so every ray retains a
+    /// direction to improve and a pose whose wall rays all start far away can
+    /// still be pulled in. That is what the previous hard clamp destroyed.
+    /// Second, the kernel is bounded, so no single bad cluster of rays can drive
+    /// the score, which is why a robust kernel is used here rather than a plain
+    /// Gaussian plus an outlier cutoff.
     /// </summary>
     private static float PointScore(float distance)
     {
-        float sigma = SCORE_SIGMA_MM;
-        return Mathf.Exp(-(distance * distance) / (2f * sigma * sigma));
+        float rolloff_squared = SCORE_ROLLOFF_MM * SCORE_ROLLOFF_MM;
+        return rolloff_squared / (rolloff_squared + 2f * distance * distance);
     }
 
     /// <summary>

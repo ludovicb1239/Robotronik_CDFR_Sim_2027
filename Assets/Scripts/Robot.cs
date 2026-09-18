@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
 
 [System.Serializable]
 public struct Pos
@@ -18,9 +20,34 @@ public class Robot : MonoBehaviour
     [SerializeField, Range(0f, 500f)] private float position_noise_mm = 0f;
     [SerializeField, Range(0f, 45f)] private float angle_noise_deg = 0f;
 
+    [Header("Controls")]
+    [SerializeField] private float movement_speed = 2f;
+    [SerializeField] private float rotation_speed = 90f;
+
+    [Header("HUD")]
+    [SerializeField] private Text positionnement_text;
+
+    private InputAction move_action;
+    private InputAction rotate_action;
+
+    private int positionnement_total;
+    private int positionnement_fails;
+
+    private float residual_x_mm;
+    private float residual_y_mm;
+    private float residual_a_deg;
+
     void Start()
     {
-        
+        move_action = InputSystem.actions.FindAction("Player/Move");
+        rotate_action = InputSystem.actions.FindAction("Player/Rotate");
+
+        UpdatePositionnementText();
+    }
+
+    void FixedUpdate()
+    {
+        HandleControls();        
     }
 
     void Update()
@@ -39,6 +66,11 @@ public class Robot : MonoBehaviour
             float unity_yaw = transform.eulerAngles.y;
 
             // A full scan has just been produced: lidar.measurements is ready.
+
+            // A "fail" is any scan the estimator could not place reliably: either
+            // it rejected the scan outright, or the residual left over is larger
+            // than the tolerance used to warn below.
+            positionnement_total++;
             Pos approximate_position = new Pos
             {
                 pos_x = transform.position.x * 1000f + Random.Range(-position_noise_mm, position_noise_mm),
@@ -62,8 +94,15 @@ public class Robot : MonoBehaviour
 
             float residual_distance = Mathf.Sqrt(residual_x * residual_x + residual_y * residual_y);
 
-            if (residual_distance > 5f || Mathf.Abs(residual_a) > 0.5f)
+            residual_x_mm = residual_x;
+            residual_y_mm = residual_y;
+            residual_a_deg = residual_a;
+            UpdatePositionnementText();
+
+            if (PosEstimator.LastEstimateWasRejected || residual_distance > 5f || Mathf.Abs(residual_a) > 0.5f)
             {
+                positionnement_fails++;
+
                 Debug.LogWarning($"Could not find exact position: error " +
                                  $"({approximate_position.pos_x - real_position.pos_x:F0}, " +
                                  $"{approximate_position.pos_y - real_position.pos_y:F0}, " +
@@ -76,6 +115,37 @@ public class Robot : MonoBehaviour
 
             lidar.BeginSweep();
         }
+    }
+
+    /// <summary>
+    /// Shows how many positionnement attempts failed out of the total attempted,
+    /// plus the ground-truth residual of the latest estimate.
+    /// </summary>
+    private void UpdatePositionnementText()
+    {
+        if (positionnement_text == null)
+        {
+            return;
+        }
+
+        positionnement_text.text =
+            $"Fails: {positionnement_fails}/{positionnement_total}\n" +
+            $"Residual: ({residual_x_mm:F1}, {residual_y_mm:F1}) mm, {residual_a_deg:F2} deg";
+    }
+
+    /// <summary>
+    /// Moves the robot with WASD (Player/Move) and rotates it with Q/E (Player/Rotate).
+    /// </summary>
+    private void HandleControls()
+    {
+        Vector2 move = move_action != null ? move_action.ReadValue<Vector2>() : Vector2.zero;
+
+        Vector3 translation = new Vector3(-move.y, 0f, move.x) * (movement_speed * Time.deltaTime);
+        transform.Translate(translation, Space.World);
+
+        float turn = rotate_action != null ? rotate_action.ReadValue<float>() : 0f;
+
+        transform.Rotate(0f, turn * rotation_speed * Time.deltaTime, 0f, Space.World);
     }
 
     /// <summary>
