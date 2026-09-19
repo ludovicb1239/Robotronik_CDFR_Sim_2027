@@ -16,7 +16,24 @@ public class Lidar : MonoBehaviour
     [SerializeField] private float sensor_precision_mm = 5f;    // +/- error in mm
     [SerializeField] private LayerMask ignore_hitbox_mask;      // hit, drawn, but not measured
     [SerializeField] private LineRenderer lineRenderer;
+
+    /// <summary>
+    /// Draws the rays the obstacle filter discarded, so the classification can be
+    /// inspected visually instead of inferred from the surviving ray count. A
+    /// second renderer is used rather than recolouring the main one because the
+    /// discarded rays are not a subset of the kept ones - they are a different set
+    /// of points, drawn over the same scan.
+    /// </summary>
+    [SerializeField] private LineRenderer bad_line_renderer;
+
     private List<Vector3> hit_positions = new List<Vector3>();
+
+    /// <summary>
+    /// Hit points of the rays the filter rejected, parallel to the discarded
+    /// measurements. Drawn by <see cref="bad_line_renderer"/> and cleared with the
+    /// rest of the scan.
+    /// </summary>
+    private List<Vector3> discarded_positions = new List<Vector3>();
 
     // (angle in degrees, distance in meters) measured this scan
     public List<Measurement> measurements = new List<Measurement>();
@@ -66,6 +83,14 @@ public class Lidar : MonoBehaviour
 
         lineRenderer.useWorldSpace = true;
         lineRenderer.loop = false;
+
+        // The bad renderer is optional: when it is not wired up the filter still
+        // runs and the discarded set is still tracked, it is simply not drawn.
+        if (bad_line_renderer != null)
+        {
+            bad_line_renderer.useWorldSpace = true;
+            bad_line_renderer.loop = false;
+        }
     }
 
     private void Start()
@@ -96,6 +121,7 @@ public class Lidar : MonoBehaviour
     public void BeginSweep()
     {
         hit_positions.Clear();
+        discarded_positions.Clear();
         measurements.Clear();
         scan_accumulator = 0f;
     }
@@ -116,6 +142,7 @@ public class Lidar : MonoBehaviour
     private void CastScan()
     {
         hit_positions.Clear();
+        discarded_positions.Clear();
         measurements.Clear();
 
         float degrees_per_ray = 360f / Mathf.Max(1, rays_per_scan);
@@ -128,6 +155,7 @@ public class Lidar : MonoBehaviour
         RemoveOccludedRays();
 
         UpdateLineRenderer();
+        UpdateBadLineRenderer();
     }
 
     /// <summary>
@@ -184,14 +212,40 @@ public class Lidar : MonoBehaviour
             ranges_mm[i] = measurements[i].distance * 1000f;
         }
 
-        // Forward pass: a ray is occluded when the nearest preceding sharp move
-        // was a drop rather than a rise.
-        bool[] occluded_forward = new bool[count];
-        bool occluded = false;
+        // The scan is a closed revolution, so ray count-1 is adjacent to ray 0 in
+        // the world. Walking the array as a plain line therefore misses any
+        // occluded span that straddles the seam, which is exactly the case where
+        // the first and last rays of the scan are on an obstacle.
+        //
+        // The passes below consequently wrap around the ring. Each walks the
+        // cycle once starting from a seed ray assumed unoccluded, then continues
+        // a full lap so every ray is visited after a boundary decision has been
+        // made at least once. The seed is the longest-range ray: it is the one
+        // worst placed to be inside an occluded span, since an occluder can only
+        // bring a range down.
+        int seed = 0;
 
         for (int i = 1; i < count; i++)
         {
-            float delta = ranges_mm[i] - ranges_mm[i - 1];
+            if (ranges_mm[i] > ranges_mm[seed])
+            {
+                seed = i;
+            }
+        }
+
+        // Forward pass: a ray is occluded when the nearest preceding sharp move
+        // was a drop rather than a rise. Starting at the seed and going a full
+        // lap, plus two steps, guarantees the first ray visited after the seed
+        // has inherited a real boundary decision rather than an arbitrary false.
+        bool[] occluded_forward = new bool[count];
+        bool occluded = false;
+
+        for (int step = 1; step <= count + 1; step++)
+        {
+            int i = (seed + step) % count;
+            int previous = (seed + step - 1) % count;
+
+            float delta = ranges_mm[i] - ranges_mm[previous];
 
             if (delta < -JUMP_MM)
             {
@@ -202,7 +256,12 @@ public class Lidar : MonoBehaviour
                 occluded = false;
             }
 
-            occluded_forward[i] = occluded;
+            // The wrap-around steps only exist to settle the state at the seam;
+            // they must not overwrite an already-final classification.
+            if (step <= count)
+            {
+                occluded_forward[i] = occluded;
+            }
         }
 
         // Backward pass: the same walk in the opposite direction. Starting from
@@ -211,9 +270,12 @@ public class Lidar : MonoBehaviour
         bool[] occluded_backward = new bool[count];
         occluded = false;
 
-        for (int i = count - 2; i >= 0; i--)
+        for (int step = 1; step <= count + 1; step++)
         {
-            float delta = ranges_mm[i] - ranges_mm[i + 1];
+            int i = (seed - step + count * 2) % count;
+            int previous = (seed - step + 1 + count * 2) % count;
+
+            float delta = ranges_mm[i] - ranges_mm[previous];
 
             if (delta < -JUMP_MM)
             {
@@ -224,15 +286,28 @@ public class Lidar : MonoBehaviour
                 occluded = false;
             }
 
-            occluded_backward[i] = occluded;
+            if (step <= count)
+            {
+                occluded_backward[i] = occluded;
+            }
         }
 
-        // Keep a ray unless both passes agree that it is occluded.
+        // Keep a ray unless both passes agree that it is occluded. Rejected rays
+        // are copied out to their own list first, so the bad renderer can draw
+        // exactly the geometry the filter removed.
         bool[] keep = new bool[count];
 
         for (int i = 0; i < count; i++)
         {
             keep[i] = !(occluded_forward[i] && occluded_backward[i]);
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            if (!keep[i] && i < hit_positions.Count)
+            {
+                discarded_positions.Add(hit_positions[i]);
+            }
         }
 
         // Rebuild both parallel lists from the surviving rays, so the drawn
@@ -325,6 +400,38 @@ public class Lidar : MonoBehaviour
         {
             lineRenderer.SetPosition(i*2, transform.position);
             lineRenderer.SetPosition(i*2+1, hit_positions[i]);
+        }
+    }
+
+    /// <summary>
+    /// Draws the rays the obstacle filter discarded, from the sensor out to the
+    /// rejected hit point, using the same paired-position layout as the main
+    /// renderer.
+    ///
+    /// Handles the empty case explicitly: a scan in which the filter rejected
+    /// nothing must clear the previous frame's lines, or the bad renderer would
+    /// keep showing geometry that is no longer being discarded. The count is set
+    /// to zero rather than left alone, so the stale positions are dropped.
+    /// </summary>
+    private void UpdateBadLineRenderer()
+    {
+        if (bad_line_renderer == null)
+        {
+            return;
+        }
+
+        if (discarded_positions.Count == 0)
+        {
+            bad_line_renderer.positionCount = 0;
+            return;
+        }
+
+        bad_line_renderer.positionCount = discarded_positions.Count * 2;
+
+        for (int i = 0; i < discarded_positions.Count; i++)
+        {
+            bad_line_renderer.SetPosition(i * 2, transform.position);
+            bad_line_renderer.SetPosition(i * 2 + 1, discarded_positions[i]);
         }
     }
 }

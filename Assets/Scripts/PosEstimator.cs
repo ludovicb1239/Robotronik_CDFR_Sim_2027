@@ -9,40 +9,46 @@ using UnityEngine;
 /// Convention: X is forward, 0 deg points along +X, Y is left, 90 deg points
 /// along +Y. Angles are counter-clockwise.
 ///
-/// Scoring: each ray scores a robust kernel of the distance d from its hit
-/// point to the nearest field wall, and the pose score is the mean over rays.
-/// The kernel is 1 on a wall and decays smoothly, so a point near a wall
-/// carries strong positional information while a point far from every wall -
-/// which is what an obstacle return looks like - contributes a small, bounded
-/// pull rather than either a hard zero or an outsized vote. Crucially it never
-/// becomes exactly flat, so the search always has a gradient to follow even
-/// when the whole scan starts well away from the walls.
+/// Scoring: each ray is resolved along its own bearing against the field walls.
+/// The wall's range is found by exact ray intersection, and the measured range
+/// is compared against it. A measurement that is shorter than the wall's range
+/// was stopped early by an obstacle, which is a valid and expected outcome:
+/// walls are the furthest thing the robot can see, so such a ray is scored at
+/// the floor and contributes nothing to the mean. This is what keeps obstacle
+/// geometry from pulling the pose, and it needs no tolerance on position, no
+/// clustering and no pose-dependent classification of which rays are "far".
 ///
-/// Algorithm: zooming coordinate-descent scan matching. Instead of scoring the
-/// whole (dx, dy, da) box, the search sweeps one axis at a time - heading, then
-/// X, then Y - because a robot pose error is dominated by a single axis at a
-/// time and each axis converges independently around a tight odometry prior.
-/// After every sweep the search range shrinks by ZOOM_FACTOR, so the same sweep
-/// progressively changes from broad exploration into fine refinement of the
-/// peak, and the sub-cell accuracy falls out of the final narrow sweeps rather
-/// than a separate parabola fit.
+/// The remaining rays - the ones that did reach a wall - are scored by a robust
+/// kernel of their range error, and the pose score is the mean over all rays.
+/// The kernel is bounded so no single ray can drive the score, and it never
+/// becomes exactly flat so the search always has a gradient to follow.
+///
+/// Algorithm: coordinate-descent scan matching at a fixed stride. Instead of
+/// scoring the whole (dx, dy, da) box, the search sweeps one axis at a time -
+/// heading, then X, then Y - because a robot pose error is dominated by a single
+/// axis at a time and each axis converges independently around a tight odometry
+/// prior. Each axis is sampled at TARGET_STEP_MM spacing, so the span a sweep
+/// covers is set by the number of samples rather than the other way round. This
+/// separation matters: the span must stay wide enough to contain the error, while
+/// the spacing must be fine enough to resolve the peak, and tying the two
+/// together makes a wide search necessarily coarse. Sweeping repeats until a
+/// whole sweep stops improving the score.
 ///
 /// Cost: a box search samples (2na+1)(2nx+1)(2ny+1) full poses, while one sweep
 /// samples only (2na+1)+(2nx+1)+(2ny+1) and that count is fixed by
-/// POINTS_PER_SWEEP regardless of how coarse or fine the range is. The sweeps
-/// also reuse work the box cannot: the scan is projected once per sweep and each
-/// candidate is a cheap translation or rotation of those points.
+/// POINTS_PER_SWEEP regardless of how wide or fine the stride is. Every
+/// candidate is scored as a full pose, because the occlusion test depends on
+/// which wall each bearing reaches and that is not a translation of the previous
+/// answer.
 ///
 /// The inner loop is kept cheap by three things, in order of impact:
-/// 1. the field has only eight boundary segments, so the exact distance from a
-///    point to the nearest wall is eight clamped projections - cheap enough
-///    that no baked distance field or spatial index is needed, and exact rather
-///    than quantised and interpolated;
-/// 2. each ray's range and bearing are baked once per scan, so projecting the
-///    scan carries no per-ray trigonometry and each candidate pose is a single
-///    rotation and translation of the already-computed bearing;
+/// 1. the field has only eight boundary segments, so an exact ray intersection is
+///    a handful of arithmetic per segment and needs no spatial index;
+/// 2. each ray's bearing is baked once per scan, so a candidate pose costs a
+///    rotation of the precomputed bearing rather than fresh trigonometry;
 /// 3. the score is a bounded rational kernel, which the compiler turns into a
 ///    multiply-add, a divide and no transcendental call at all.
+/// </summary>
 ///
 /// Note on obstacle rays: they are deliberately still scored, not filtered out.
 /// Filtering them was tried and regressed, because an obstacle return is a
@@ -114,13 +120,12 @@ public static class PosEstimator
     /// </summary>
     private static readonly Vector2[] segment_start;
     private static readonly Vector2[] segment_edge;
-    private static readonly float[] segment_length_squared;
 
     /// <summary>
     /// Fills the flattened segment tables from <see cref="FIELD_OUTLINE"/>. The
     /// polygon's last vertex is wired back to the first, so the closing edge is
-    /// present in the table like any other and the distance walk needs no
-    /// wrap-around special case.
+    /// present in the table like any other and the raycast needs no wrap-around
+    /// special case.
     /// </summary>
     static PosEstimator()
     {
@@ -128,17 +133,14 @@ public static class PosEstimator
 
         segment_start = new Vector2[count];
         segment_edge = new Vector2[count];
-        segment_length_squared = new float[count];
 
         for (int i = 0; i < count; i++)
         {
             Vector2 a = FIELD_OUTLINE[i];
             Vector2 b = FIELD_OUTLINE[(i + 1) % count];
-            Vector2 edge = b - a;
 
             segment_start[i] = a;
-            segment_edge[i] = edge;
-            segment_length_squared[i] = edge.sqrMagnitude;
+            segment_edge[i] = b - a;
         }
     }
 
@@ -148,37 +150,126 @@ public static class PosEstimator
     private static float[] scan_range_mm;
 
     // --- Search schedule ---------------------------------------------------
-    /// <summary>Half-width of the initial search box around the approximate pose, in mm.</summary>
-    private const float RANGE_MM = 200f;
-
-    /// <summary>Half-width of the initial search box around the approximate heading, in degrees.</summary>
-    private const float ANGLE_RANGE_DEG = 20f;
-
-    /// <summary>Total number of coordinate-descent sweeps performed per estimate.</summary>
-    private const int TOTAL_STEPS = 12;
-
     /// <summary>
     /// Sample points taken on each side of the current best, per sweep. A sweep
-    /// therefore evaluates 2*POINTS_PER_SWEEP+1 candidates per axis.
+    /// therefore evaluates 2*POINTS_PER_SWEEP+1 candidates per axis, and covers a
+    /// span of 2*POINTS_PER_SWEEP strides.
     /// </summary>
     private const int POINTS_PER_SWEEP = 20;
 
     /// <summary>
-    /// Shrink applied to the search range after every sweep. Below 1 this
-    /// zooms in on the current peak, giving coarse-to-fine behaviour without
-    /// separate stages: early sweeps explore the box, later sweeps refine.
+    /// Hard ceiling on the number of coordinate-descent sweeps per estimate.
+    ///
+    /// This is a ceiling, not a schedule: the search normally exits early once a
+    /// whole sweep stops improving, and the ceiling only exists so a scan that is
+    /// still crawling cannot run forever.
+    ///
+    /// It used to be 12 with no early exit, which measurement showed was the
+    /// binding constraint rather than the available range. Across 1036 recorded
+    /// scans, the scans that failed the 5 mm bar still improved the score on
+    /// EVERY sweep they were given - median 12 of 12 improving - while clamped
+    /// sweeps were rare (median 1). That combination means the search was not
+    /// stuck and was not running out of range: it was converging geometrically
+    /// along one axis at a time and being cut off mid-crawl. Since coordinate
+    /// descent interleaves the axes, a large correction on a single axis needs
+    /// many sweeps to accumulate, and 12 was simply not enough of them.
     /// </summary>
-    private const float ZOOM_FACTOR = 0.6f;
+    private const int MAX_TOTAL_STEPS = 40;
 
     /// <summary>
-    /// Smallest search range worth using, in mm. The range is clamped here so
-    /// the step never collapses into denormal territory, which would waste the
-    /// remaining steps and make the sweep positions numerically meaningless.
+    /// Absolute score gain below which a whole sweep counts as having converged.
+    ///
+    /// Score gains fall off geometrically as the pose approaches the peak, so a
+    /// sweep that moves the score by less than this has nothing left to find.
+    /// This is what lets the easy majority of scans exit after a handful of
+    /// sweeps instead of paying the full ceiling.
     /// </summary>
-    private const float MIN_RANGE_MM = 1f;
+    private const float SWEEP_CONVERGENCE_EPSILON = 1e-6f;
 
-    /// <summary>Smallest search range worth using, in degrees.</summary>
-    private const float MIN_ANGLE_RANGE_DEG = 0.1f;
+    /// <summary>
+    /// Target spacing between adjacent samples along an axis, in mm.
+    ///
+    /// This is what actually sets the achievable precision, and decoupling it
+    /// from the search range is the point. A sweep samples
+    /// 2*POINTS_PER_SWEEP+1 points spanning the current range, so its spacing is
+    /// range / POINTS_PER_SWEEP. If the range alone decided the spacing, a wide
+    /// search would be coarse and only a narrow search would resolve the peak,
+    /// which forces a trade: the range must stay wide enough to contain the
+    /// error while the spacing must become fine enough to pin the peak down.
+    ///
+    /// The sweep therefore takes a fixed number of strides of this size,
+    /// centred on the current best, instead of a fixed span divided evenly. The
+    /// span it covers is 2*POINTS_PER_SWEEP*this value, which at 20 points is
+    /// +/- 60 mm - comfortably more than the prior's +/75 mm error once the
+    /// first sweep has moved the pose most of the way, and fine enough that the
+    /// residual is set by the objective rather than by the grid.
+    /// </summary>
+    private const float TARGET_STEP_MM = 3f;
+
+    /// <summary>
+    /// Target angular spacing between adjacent samples, in degrees. The angular
+    /// equivalent of <see cref="TARGET_STEP_MM"/>; the span covered is
+    /// 2*POINTS_PER_SWEEP*this value, i.e. about +/- 2.4 deg.
+    ///
+    /// A 5 deg prior error is 175 mm of arc at 2 m, so the first sweep has to
+    /// cover a wide angle; later sweeps only need to resolve the peak, and this
+    /// spacing is fine enough for that at any range in the field.
+    /// </summary>
+    private const float TARGET_ANGLE_STEP_DEG = 0.12f;
+
+    /// <summary>
+    /// Range slack, in mm, below which a measured range counts as a wall hit
+    /// rather than an occlusion.
+    ///
+    /// A ray is occluded when it was stopped before reaching the wall, which is a
+    /// purely one-sided comparison: walls are the furthest thing the robot can
+    /// see, so a measurement can only ever be shorter than the wall's range, never
+    /// longer. The slack exists to absorb the sensor's own range noise and the
+    /// candidate pose's error, both of which make the measured and predicted
+    /// ranges differ even for a genuine wall hit.
+    /// </summary>
+    private const float OCCLUSION_SLACK_MM = 3f * SCORE_SIGMA_MM;
+
+    /// <summary>
+    /// Target angular spacing between adjacent samples in the refinement phase,
+    /// in degrees. The angular counterpart of <see cref="REFINE_STEP_MM"/>.
+    /// </summary>
+    private const float REFINE_ANGLE_STEP_DEG = 0.02f;
+
+    /// <summary>
+    /// Final spacing between adjacent samples, in mm, used by the refinement
+    /// phase after the coarse phase has localised the peak.
+    ///
+    /// The coarse stride sets the span a sweep can travel, but it also sets the
+    /// finest distinction the search can make: a coordinate-descent step can only
+    /// land on a sample, so the reachable poses form a grid of the stride's
+    /// spacing. Measurement showed exactly that limit. Across 400 scans the mean
+    /// residual was 0.26 mm - so there was no bias at all - yet the scatter was
+    /// about 6 mm, roughly two coarse strides, and the search always stopped
+    /// after two to five sweeps because no sampled candidate improved the pose.
+    /// That is the signature of a search that has run out of grid, not of one
+    /// that has run out of information: the truth lay between samples.
+    ///
+    /// The refinement phase re-sweeps at this spacing over a much smaller span,
+    /// reached by taking POINTS_PER_REFINEMENT_SWEEP strides, so it can resolve
+    /// a peak the coarse grid straddled without paying for a fine grid across the
+    /// whole search area.
+    /// </summary>
+    private const float REFINE_STEP_MM = 1f;
+
+    /// <summary>
+    /// Sample points taken on each side of the current best, per refinement
+    /// sweep. Smaller than POINTS_PER_SWEEP because a refinement sweep only has
+    /// to cover the coarse grid's spacing, not the whole prior error.
+    /// </summary>
+    private const int POINTS_PER_REFINEMENT_SWEEP = 8;
+
+    /// <summary>
+    /// Sweeps allowed in the refinement phase. Coordinate descent needs a few
+    /// passes for the axes to settle once the steps are this small, and the
+    /// phase exits early as soon as a sweep stops improving.
+    /// </summary>
+    private const int MAX_REFINEMENT_SWEEPS = 8;
 
     /// <summary>
     /// Fraction of the available score headroom the search must capture to
@@ -200,51 +291,123 @@ public static class PosEstimator
     /// <summary>Sweeps the last estimate actually ran before converging.</summary>
     public static int LastSweepCount { get; private set; }
 
+    /// <summary>Score of the approximate (prior) pose, at the start of the last estimate.</summary>
+    public static float LastBaseScore { get; private set; }
+
     /// <summary>
-    /// Distance from a point to the nearest field wall segment, clamped to the
-    /// segment ends, by walking all eight boundary edges.
-    ///
-    /// This is exact, unlike the interpolated lookup it replaces. It is called
-    /// once per ray per candidate pose, so it is the hot path; eight segment
-    /// projections is small enough that no acceleration structure is warranted,
-    /// and keeping it exact removes the quantisation and interpolation error the
-    /// baked field carried while also dropping the multimegabyte array.
+    /// Score of the pose the search returned. Compared against the score at the
+    /// true pose this says whether the search stopped early or the objective
+    /// itself is biased.
     /// </summary>
-    private static float DistanceToNearestWall(Vector2 point)
+    public static float LastBestScore { get; private set; }
+
+    /// <summary>
+    /// Final search half-width in mm, after the last zoom. When this is small
+    /// while a residual remains, the range shrank past the remaining correction
+    /// and the search could no longer travel to the peak.
+    /// </summary>
+    public static float LastFinalRangeMm { get; private set; }
+
+    /// <summary>Final angular search half-width in degrees, after the last zoom.</summary>
+    public static float LastFinalAngleRangeDeg { get; private set; }
+
+    /// <summary>
+    /// Sweeps in the last estimate in which at least one axis picked the extreme
+    /// sample it was offered. Picking the edge means the true optimum lay outside
+    /// the sampled window, so the zoom shrank the range before the axis had
+    /// finished travelling - the direct symptom of a schedule that zooms too
+    /// eagerly.
+    /// </summary>
+    public static int LastClampedSweeps { get; private set; }
+
+    /// <summary>
+    /// Sweeps in the last estimate that improved the score at all. If this is
+    /// well below the sweep count, the search was flat for the later sweeps,
+    /// which points at the objective rather than the schedule.
+    /// </summary>
+    public static int LastImprovingSweeps { get; private set; }
+
+    /// <summary>
+    /// Rays in the last estimate whose measured range matched the wall's range on
+    /// the same bearing, i.e. rays that were genuine wall hits rather than
+    /// occlusions. Reported for diagnosis: a correct pose should classify most
+    /// rays as wall hits, whereas a pose that is sliding along a wall tends to
+    /// leave many rays unexplained.
+    /// </summary>
+    public static int LastWallHitCount { get; private set; }
+
+    /// <summary>
+    /// Distance from a ray origin along a direction to the first field wall, in
+    /// mm, or <see cref="float.PositiveInfinity"/> when the ray never meets one.
+    ///
+    /// Standard segment intersection in the ray's frame: the wall from A along E
+    /// meets the ray from O along D where the two cross, which is a 2x2 solve.
+    /// A crossing counts only when it lies ahead of the ray (t &gt; 0) and inside
+    /// the finite wall segment (0 &lt;= u &lt;= 1), so the result is the distance
+    /// to the wall itself rather than to the infinite line it lies on.
+    ///
+    /// This is the piece that makes an occlusion test possible at all. Comparing
+    /// a measured range against the wall's range along the same bearing is a
+    /// like-for-like comparison of two distances along one ray; measuring the
+    /// distance from a hit point to the nearest wall, which is what the score did
+    /// before, mixes a measurement with a quantity that is not what the sensor
+    /// reported.
+    /// </summary>
+    private static float RaycastWall(float origin_x, float origin_y, float dir_x, float dir_y)
     {
-        float best_distance_squared = float.MaxValue;
+        float nearest = float.PositiveInfinity;
 
         for (int i = 0; i < segment_start.Length; i++)
         {
             float ex = segment_edge[i].x;
             float ey = segment_edge[i].y;
 
-            float ax = point.x - segment_start[i].x;
-            float ay = point.y - segment_start[i].y;
+            // Denominator of the 2x2 solve. Zero means ray and wall are parallel.
+            float den = dir_x * ey - dir_y * ex;
 
-            // Project onto the segment and clamp to its ends, so the distance is
-            // measured to the wall itself and not to its infinite extension.
-            float length_squared = segment_length_squared[i];
-
-            if (length_squared <= 0f)
+            if (Mathf.Abs(den) < 1e-9f)
             {
                 continue;
             }
 
-            float t = (ax * ex + ay * ey) / length_squared;
-            t = t < 0f ? 0f : (t > 1f ? 1f : t);
+            float ax = segment_start[i].x - origin_x;
+            float ay = segment_start[i].y - origin_y;
 
-            float dx = ax - t * ex;
-            float dy = ay - t * ey;
-            float distance_squared = dx * dx + dy * dy;
+            float t = (ax * ey - ay * ex) / den;
+            float u = (ax * dir_y - ay * dir_x) / den;
 
-            if (distance_squared < best_distance_squared)
+            if (t > 1e-6f && u >= 0f && u <= 1f && t < nearest)
             {
-                best_distance_squared = distance_squared;
+                nearest = t;
             }
         }
 
-        return Mathf.Sqrt(best_distance_squared);
+        return nearest;
+    }
+
+    /// <summary>
+    /// Scores an arbitrary pose with the same objective the search maximises.
+    ///
+    /// This exists purely for diagnosis: comparing the score at the pose the
+    /// search returned against the score at the true pose separates the two
+    /// possible reasons a search can come up short. If the true pose scores
+    /// higher, the search stopped early and the schedule is at fault. If the
+    /// returned pose scores higher, the search found the best available peak and
+    /// the objective itself is biased, which no amount of search tuning fixes.
+    ///
+    /// Uses a throwaway workspace so it cannot disturb an estimate in progress,
+    /// and it does not touch the Last* diagnostics.
+    /// </summary>
+    public static float ScoreAt(
+        List<Lidar.Measurement> measurements,
+        Pos pose,
+        Pos lidar_offset)
+    {
+        PrepareScan(measurements);
+
+        SearchWorkspace workspace = new SearchWorkspace();
+
+        return ScorePose(measurements, pose, lidar_offset, workspace);
     }
 
     /// <summary>
@@ -266,6 +429,12 @@ public static class PosEstimator
     {
         LastEstimateWasRejected = false;
         LastRejectionReason = string.Empty;
+        LastBaseScore = 0f;
+        LastBestScore = 0f;
+        LastFinalRangeMm = 0f;
+        LastFinalAngleRangeDeg = 0f;
+        LastClampedSweeps = 0;
+        LastImprovingSweeps = 0;
 
         if (measurements.Count < 2)
         {
@@ -275,7 +444,7 @@ public static class PosEstimator
 
         PrepareScan(measurements);
 
-        SearchWorkspace workspace = new SearchWorkspace(measurements.Count);
+        SearchWorkspace workspace = new SearchWorkspace();
 
         System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
 
@@ -287,6 +456,7 @@ public static class PosEstimator
         clock.Stop();
         LastEstimateMs = clock.Elapsed.TotalMilliseconds;
         LastSweepCount = workspace.sweeps_run;
+        LastBaseScore = base_score;
 
         float best_x = best.x;
         float best_y = best.y;
@@ -343,47 +513,15 @@ public static class PosEstimator
         }
     }
 
+
     /// <summary>
-    /// Projects the scan from a candidate robot pose into field coordinates.
-    /// The lidar sits at an offset from the robot's centre, so that offset is
-    /// rotated by the candidate heading before the rays are cast.
+    /// Scores the scan from a candidate robot pose.
     ///
-    /// Each ray's range in mm and the sine/cosine of its own bearing are baked
-    /// once per scan by <see cref="PrepareScan"/>, so this loop is only the
-    /// per-pose rotation and translation.
-    /// </summary>
-    private static Vector2[] ProjectScan(
-        List<Lidar.Measurement> measurements,
-        Pos pose,
-        Pos lidar_offset,
-        Vector2[] buffer)
-    {
-        float a_rad = pose.pos_a * Mathf.Deg2Rad;
-        float cos_a = Mathf.Cos(a_rad);
-        float sin_a = Mathf.Sin(a_rad);
-
-        // Lidar origin in field coordinates.
-        float origin_x = pose.pos_x + lidar_offset.pos_x * cos_a - lidar_offset.pos_y * sin_a;
-        float origin_y = pose.pos_y + lidar_offset.pos_x * sin_a + lidar_offset.pos_y * cos_a;
-
-        // Rotating each ray by the pose is a single complex multiply against the
-        // precomputed bearing, so no per-ray trig remains here.
-        for (int i = 0; i < measurements.Count; i++)
-        {
-            float local_x = scan_cos[i];
-            float local_y = scan_sin[i];
-            float range_mm = scan_range_mm[i];
-
-            buffer[i] = new Vector2(
-                origin_x + range_mm * (local_x * cos_a - local_y * sin_a),
-                origin_y + range_mm * (local_x * sin_a + local_y * cos_a));
-        }
-
-        return buffer;
-    }
-
-    /// <summary>
-    /// Scores the scan projected from a candidate robot pose.
+    /// The lidar origin is placed in the field for the candidate pose, and each
+    /// ray is resolved along its own bearing: either it reaches the wall, in
+    /// which case the measured range is compared against the wall's range, or it
+    /// is stopped short by an obstacle, in which case it is allowed to be shorter
+    /// and contributes a constant.
     /// </summary>
     private static float ScorePose(
         List<Lidar.Measurement> measurements,
@@ -391,34 +529,53 @@ public static class PosEstimator
         Pos lidar_offset,
         SearchWorkspace workspace)
     {
-        ProjectScan(measurements, pose, lidar_offset, workspace.base_points);
-        return ScoreProjected(workspace.base_points);
-    }
+        float a_rad = pose.pos_a * Mathf.Deg2Rad;
+        float cos_a = Mathf.Cos(a_rad);
+        float sin_a = Mathf.Sin(a_rad);
 
-    /// <summary>
-    /// Mean score over every projected point, where a point's score is the
-    /// robust kernel of the distance from that point to the nearest wall.
-    ///
-    /// The distance is measured to the nearest of the eight boundary segments,
-    /// found by walking them, which is exact where the baked distance field used
-    /// to interpolate. Note that this is a point-to-wall distance, not a
-    /// comparison of measured and predicted range: the two agree only when the
-    /// ray truly terminated on a wall. For an obstacle return they differ, which
-    /// is deliberate - the kernel makes such a point contribute a small bounded
-    /// pull rather than pretending the wall was closer than it is.
-    /// </summary>
-    private static float ScoreProjected(Vector2[] points)
-    {
+        float origin_x = pose.pos_x + lidar_offset.pos_x * cos_a - lidar_offset.pos_y * sin_a;
+        float origin_y = pose.pos_y + lidar_offset.pos_x * sin_a + lidar_offset.pos_y * cos_a;
+
         float score = 0f;
-        int count = points.Length;
+        int wall_hits = 0;
 
-        for (int i = 0; i < count; i++)
+        for (int i = 0; i < measurements.Count; i++)
         {
-            score += PointScore(DistanceToNearestWall(points[i]));
+            float local_x = scan_cos[i];
+            float local_y = scan_sin[i];
+
+            // Ray direction in field coordinates.
+            float dir_x = local_x * cos_a - local_y * sin_a;
+            float dir_y = local_x * sin_a + local_y * cos_a;
+
+            float wall_range_mm = RaycastWall(origin_x, origin_y, dir_x, dir_y);
+            float measured_mm = scan_range_mm[i];
+
+            // Walls are the furthest thing visible, so a measurement shorter than
+            // the wall's range means something blocked the beam. Such a ray is
+            // uninformative about the pose: it is scored at the floor and adds
+            // nothing to the mean, so obstacle geometry can neither attract the
+            // pose nor be mistaken for a wall.
+            //
+            // The comparison is one-sided by construction. A measurement longer
+            // than the wall's range is physically impossible; it is treated as a
+            // miss and scored at the floor rather than trusted.
+            if (measured_mm < wall_range_mm - OCCLUSION_SLACK_MM)
+            {
+                score += PointScore(OCCLUSION_SLACK_MM * 2f);
+                continue;
+            }
+
+            float range_error = measured_mm - wall_range_mm;
+            score += PointScore(range_error);
+            wall_hits++;
         }
 
-        return count > 0 ? score / count : 0f;
+        LastWallHitCount = wall_hits;
+
+        return measurements.Count > 0 ? score / measurements.Count : 0f;
     }
+
 
     /// <summary>Outcome of one search schedule.</summary>
     private struct PoseEstimate
@@ -429,37 +586,54 @@ public static class PosEstimator
         public float score;
     }
 
-    /// <summary>Scratch buffer for one schedule, reused by every sweep.</summary>
+    /// <summary>Scratch state for one schedule.</summary>
     private sealed class SearchWorkspace
     {
-        // Projected scan for the best pose found so far.
-        public readonly Vector2[] base_points;
-
         /// <summary>Sweeps the last search actually ran, for diagnostics.</summary>
         public int sweeps_run;
 
-        public SearchWorkspace(int rays)
-        {
-            base_points = new Vector2[rays];
-        }
+        /// <summary>
+        /// Set by a sweep when the winning candidate was the outermost sample it
+        /// was offered, meaning the peak lies beyond the sampled window. Cleared
+        /// once per sweep by the caller.
+        /// </summary>
+        public bool hit_extreme;
     }
 
     /// <summary>
-    /// Runs a zooming coordinate-descent search: repeatedly sweeps the heading,
-    /// then X, then Y, sampling POINTS_PER_SWEEP either side of the current best
-    /// on each axis, and shrinking the search range by ZOOM_FACTOR after every
-    /// sweep.
+    /// Runs a coordinate-descent search that sweeps the heading, then X, then Y,
+    /// sampling POINTS_PER_SWEEP strides either side of the current best on each
+    /// axis at a FIXED stride length.
     ///
-    /// There are no separate coarse and fine stages: the early sweeps explore
-    /// the whole RANGE_MM box with a wide step, and the zoom turns the same
-    /// sweep into ever finer refinement of the peak it has found. Each sweep
-    /// keeps the other two coordinates fixed, so a sweep costs only
-    /// 3*(2*POINTS_PER_SWEEP+1) pose evaluations regardless of how coarse or
-    /// fine it is.
+    /// The stride is deliberately not derived from a shrinking search range. An
+    /// earlier version shrank both together, which coupled two things that need
+    /// opposite treatment: the span must stay wide enough to contain the error,
+    /// and the spacing must become fine enough to locate the peak. Coupling them
+    /// meant a wide search was necessarily coarse, so the pose could only be
+    /// pinned down after the range had already collapsed - and if the remaining
+    /// error exceeded the collapsed range, the search could never recover it.
+    /// Measurement showed exactly that: failing scans improved the score on every
+    /// sweep they were given, so they were still converging when the budget ran
+    /// out, and their residuals clustered tens of mm from the truth.
     ///
-    /// The range is clamped to a floor so the step never collapses to zero.
-    /// TOTAL_STEPS sweeps always run; there is no early exit, so the cost is
-    /// constant and the zoom is guaranteed to reach its narrowest step.
+    /// Taking a fixed stride instead makes each sweep cover
+    /// 2*POINTS_PER_SWEEP*TARGET_STEP_MM, about +/- 60 mm of translation and
+    /// +/- 2.4 deg of heading, with spacing fine enough that the residual is
+    /// limited by the objective rather than by the sample grid. A sweep costs the
+    /// same either way - it is a fixed number of candidate poses - so this is
+    /// strictly a better use of the same budget.
+    ///
+    /// The loop stops once a whole sweep raises the score by less than
+    /// SWEEP_CONVERGENCE_EPSILON, and is otherwise capped at MAX_TOTAL_STEPS. The
+    /// cap only binds on scans that are still crawling.
+    ///
+    /// A second phase then re-sweeps at REFINE_STEP_MM over a narrower span. The
+    /// coarse phase cannot resolve finer than its own stride, because a
+    /// coordinate-descent step can only land on a sample, so a peak lying between
+    /// two coarse samples is unreachable no matter how many coarse sweeps run.
+    /// The refinement span is POINTS_PER_REFINEMENT_SWEEP strides, deliberately
+    /// wider than one coarse stride so it can reach a peak the coarse grid
+    /// straddled, and fine enough that the residual is no longer set by sampling.
     /// </summary>
     private static PoseEstimate Search(
         List<Lidar.Measurement> measurements,
@@ -475,24 +649,92 @@ public static class PosEstimator
             score = ScorePose(measurements, centre, lidar_offset, workspace),
         };
 
-        float range_mm = RANGE_MM;
-        float range_deg = ANGLE_RANGE_DEG;
+        int clamped_sweeps = 0;
+        int improving_sweeps = 0;
 
-        for (int step_index = 0; step_index < TOTAL_STEPS; step_index++)
+        for (int step_index = 0; step_index < MAX_TOTAL_STEPS; step_index++)
         {
-            float xy_step = range_mm / POINTS_PER_SWEEP;
-            float angle_step = range_deg / POINTS_PER_SWEEP;
+            float score_before = best.score;
 
-            SweepAngle(measurements, lidar_offset, workspace, POINTS_PER_SWEEP, angle_step, ref best);
-            SweepX(measurements, lidar_offset, workspace, POINTS_PER_SWEEP, xy_step, ref best);
-            SweepY(measurements, lidar_offset, workspace, POINTS_PER_SWEEP, xy_step, ref best);
+            // Each sweep records whether it settled on the outermost sample it
+            // was offered, which means the peak lay outside the window.
+            workspace.hit_extreme = false;
+
+            SweepAngle(measurements, lidar_offset, workspace, POINTS_PER_SWEEP,
+                       TARGET_ANGLE_STEP_DEG, ref best);
+            SweepX(measurements, lidar_offset, workspace, POINTS_PER_SWEEP,
+                   TARGET_STEP_MM, ref best);
+            SweepY(measurements, lidar_offset, workspace, POINTS_PER_SWEEP,
+                   TARGET_STEP_MM, ref best);
+
+            if (workspace.hit_extreme)
+            {
+                clamped_sweeps++;
+            }
+
+            float gain = best.score - score_before;
+
+            if (gain > 0f)
+            {
+                improving_sweeps++;
+            }
 
             workspace.sweeps_run = step_index + 1;
 
-            // Zoom in on the peak, never below the smallest useful range.
-            range_mm = Mathf.Max(MIN_RANGE_MM, range_mm * ZOOM_FACTOR);
-            range_deg = Mathf.Max(MIN_ANGLE_RANGE_DEG, range_deg * ZOOM_FACTOR);
+            // Nothing left to find: stop paying for sweeps.
+            if (gain < SWEEP_CONVERGENCE_EPSILON)
+            {
+                break;
+            }
         }
+
+        // --- Refinement phase ------------------------------------------------
+        // The coarse phase has localised the peak to within about one stride, but
+        // a step can only land on a sample, so it cannot resolve finer than the
+        // stride's spacing. This phase re-sweeps at REFINE_STEP_MM over a span of
+        // POINTS_PER_REFINEMENT_SWEEP strides, which is wide enough to cover the
+        // coarse grid spacing and fine enough to resolve the peak inside it.
+        //
+        // The phase is entered unconditionally: a pose that already sits on the
+        // coarse grid still has no way to know whether it is at the peak or one
+        // stride short of it, and the first refinement sweep answers that. It
+        // exits as soon as a sweep stops improving, so a pose that was already
+        // optimal costs only a single sweep.
+        int refinement_sweeps = 0;
+
+        for (int step_index = 0; step_index < MAX_REFINEMENT_SWEEPS; step_index++)
+        {
+            float score_before = best.score;
+
+            SweepAngle(measurements, lidar_offset, workspace, POINTS_PER_REFINEMENT_SWEEP,
+                       REFINE_ANGLE_STEP_DEG, ref best);
+            SweepX(measurements, lidar_offset, workspace, POINTS_PER_REFINEMENT_SWEEP,
+                   REFINE_STEP_MM, ref best);
+            SweepY(measurements, lidar_offset, workspace, POINTS_PER_REFINEMENT_SWEEP,
+                   REFINE_STEP_MM, ref best);
+
+            refinement_sweeps++;
+
+            float gain = best.score - score_before;
+
+            if (gain > 0f)
+            {
+                improving_sweeps++;
+            }
+
+            workspace.sweeps_run = MAX_TOTAL_STEPS + refinement_sweeps;
+
+            if (gain < SWEEP_CONVERGENCE_EPSILON)
+            {
+                break;
+            }
+        }
+
+        LastBestScore = best.score;
+        LastFinalRangeMm = POINTS_PER_REFINEMENT_SWEEP * REFINE_STEP_MM;
+        LastFinalAngleRangeDeg = POINTS_PER_REFINEMENT_SWEEP * REFINE_ANGLE_STEP_DEG;
+        LastClampedSweeps = clamped_sweeps;
+        LastImprovingSweeps = improving_sweeps;
 
         return best;
     }
@@ -500,8 +742,12 @@ public static class PosEstimator
     /// <summary>
     /// Sweeps X with Y and the heading fixed.
     ///
-    /// Moving the robot along X translates the whole projected scan along X, so
-    /// the scan is projected once and each candidate is a cheap shift of it.
+    /// Each candidate is scored as a full pose rather than by translating cached
+    /// projected points. The occlusion test compares a measured range against the
+    /// wall's range along the same bearing, and moving the robot parallel to a
+    /// wall can bring a different wall into view along that bearing, so the two
+    /// sides of the comparison are no longer related by a pure translation. The
+    /// cheaper translation shortcut is therefore no longer valid.
     /// </summary>
     private static void SweepX(
         List<Lidar.Measurement> measurements,
@@ -511,44 +757,41 @@ public static class PosEstimator
         float step,
         ref PoseEstimate best)
     {
-        // Projected with the robot at x = 0; adding the candidate x to every
-        // point (and to the lidar origin) is the same as moving the robot.
-        ProjectScan(measurements, new Pos { pos_x = 0f, pos_y = best.y, pos_a = best.a },
-                    lidar_offset, workspace.base_points);
-
         float best_x = best.x;
         float best_score = best.score;
+        int best_index = 0;
 
         for (int xi = -steps; xi <= steps; xi++)
         {
             float x = best.x + xi * step;
-            float score = 0f;
 
-            for (int i = 0; i < workspace.base_points.Length; i++)
-            {
-                Vector2 point = workspace.base_points[i];
-                point.x += x;
-
-                score += PointScore(DistanceToNearestWall(point));
-            }
-
-            score /= workspace.base_points.Length;
+            Pos candidate = new Pos { pos_x = x, pos_y = best.y, pos_a = best.a };
+            float score = ScorePose(measurements, candidate, lidar_offset, workspace);
 
             if (score > best_score)
             {
                 best_score = score;
                 best_x = x;
+                best_index = xi;
             }
         }
 
         best.x = best_x;
         best.score = best_score;
+
+        // The extreme sample winning means the true optimum is outside the window
+        // on this axis, so the zoom must not be allowed to strand it.
+        if (best_index == -steps || best_index == steps)
+        {
+            workspace.hit_extreme = true;
+        }
     }
 
     /// <summary>
-    /// Sweeps Y with X and the heading fixed, again by translating the scan.
-    /// Every ray is evaluated per candidate, because the mean is taken over the
-    /// full ray count and every ray contributes some gradient.
+    /// Sweeps Y with X and the heading fixed, scoring each candidate as a full
+    /// pose for the same reason as the X sweep: the occlusion test depends on
+    /// which wall each bearing reaches, and that is not a pure translation of the
+    /// previous answer.
     /// </summary>
     private static void SweepY(
         List<Lidar.Measurement> measurements,
@@ -558,46 +801,38 @@ public static class PosEstimator
         float step,
         ref PoseEstimate best)
     {
-        ProjectScan(measurements, new Pos { pos_x = best.x, pos_y = 0f, pos_a = best.a },
-                    lidar_offset, workspace.base_points);
-
         float best_y = best.y;
         float best_score = best.score;
+        int best_index = 0;
 
         for (int yi = -steps; yi <= steps; yi++)
         {
             float y = best.y + yi * step;
-            float score = 0f;
 
-            for (int i = 0; i < workspace.base_points.Length; i++)
-            {
-                Vector2 point = workspace.base_points[i];
-                point.y += y;
-                score += PointScore(DistanceToNearestWall(point));
-            }
-
-            score /= workspace.base_points.Length;
+            Pos candidate = new Pos { pos_x = best.x, pos_y = y, pos_a = best.a };
+            float score = ScorePose(measurements, candidate, lidar_offset, workspace);
 
             if (score > best_score)
             {
                 best_score = score;
                 best_y = y;
+                best_index = yi;
             }
         }
 
         best.y = best_y;
         best.score = best_score;
+
+        if (best_index == -steps || best_index == steps)
+        {
+            workspace.hit_extreme = true;
+        }
     }
 
     /// <summary>
-    /// Sweeps the heading with X and Y fixed.
-    ///
-    /// Rotating the robot swings every ray, and the lidar offset makes each
-    /// projected point travel on an arc about the robot's centre. Points near a
-    /// wall change score fastest under rotation and so drive this sweep most,
-    /// but because the kernel never becomes flat every ray contributes some
-    /// gradient, which is what lets a scan that starts far from the walls still
-    /// rotate toward them.
+    /// Sweeps the heading with X and Y fixed, scoring each candidate as a full
+    /// pose. Rotation swings every ray, so both sides of the occlusion comparison
+    /// change together and the test has to be re-evaluated per candidate.
     /// </summary>
     private static void SweepAngle(
         List<Lidar.Measurement> measurements,
@@ -607,78 +842,57 @@ public static class PosEstimator
         float step,
         ref PoseEstimate best)
     {
-        Pos best_pose = new Pos { pos_x = best.x, pos_y = best.y, pos_a = best.a };
-        ProjectScan(measurements, best_pose, lidar_offset, workspace.base_points);
-
-        float centre_x = best.x;
-        float centre_y = best.y;
-
         float best_a = best.a;
         float best_score = best.score;
+        int best_index = 0;
 
         for (int ai = -steps; ai <= steps; ai++)
         {
             float angle = best.a + ai * step;
-            float delta = (angle - best.a) * Mathf.Deg2Rad;
-            float cos_d = Mathf.Cos(delta);
-            float sin_d = Mathf.Sin(delta);
 
-            float score = 0f;
-
-            for (int i = 0; i < workspace.base_points.Length; i++)
-            {
-                // Rotate the point about the robot centre by delta.
-                Vector2 point = workspace.base_points[i];
-                float offset_x = point.x - centre_x;
-                float offset_y = point.y - centre_y;
-
-                Vector2 rotated = new Vector2(
-                    centre_x + offset_x * cos_d - offset_y * sin_d,
-                    centre_y + offset_x * sin_d + offset_y * cos_d);
-
-                score += PointScore(DistanceToNearestWall(rotated));
-            }
-
-            score /= workspace.base_points.Length;
+            Pos candidate = new Pos { pos_x = best.x, pos_y = best.y, pos_a = angle };
+            float score = ScorePose(measurements, candidate, lidar_offset, workspace);
 
             if (score > best_score)
             {
                 best_score = score;
                 best_a = angle;
+                best_index = ai;
             }
         }
 
         best.a = best_a;
         best.score = best_score;
+
+        if (best_index == -steps || best_index == steps)
+        {
+            workspace.hit_extreme = true;
+        }
     }
 
     /// <summary>
-    /// Score contribution of a single point at a given distance from the nearest
-    /// wall, as a Geman-McClure robust kernel:
+    /// Score contribution of a ray, as a Geman-McClure robust kernel of its
+    /// range error:
     ///
-    ///     s(d) = rolloff^2 / (rolloff^2 + 2 * d^2)
+    ///     s(e) = rolloff^2 / (rolloff^2 + 2 * e^2)
     ///
-    /// Near a wall this behaves like the Gaussian it replaces - it is 1 on the
-    /// wall, halves at about 0.64 * rolloff, and its sharpest slope sits a little
-    /// inside rolloff - so the positional information that locates the robot is
-    /// unchanged. Far from a wall it decays like 1/d^2 instead of collapsing to
-    /// exp(-large), which is the whole point: an obstacle return is far from
-    /// every wall, so it contributes a small, slowly-varying pull rather than a
-    /// hard zero, and it can never outvote the wall points that sit at distance
-    /// near zero and score near 1.
+    /// where the error is the measured range minus the wall's range along the
+    /// same bearing. The kernel is 1 on a perfect match, halving at about
+    /// 0.64 * rolloff, so a ray that lands on a wall carries strong positional
+    /// information. Its tails decay only quadratically, so the function is
+    /// strictly decreasing everywhere with no flat region: every ray keeps a
+    /// direction to improve, which is what lets a pose whose wall rays all start
+    /// far away still be pulled in.
     ///
-    /// Two properties matter for the search. First, the function is strictly
-    /// decreasing in d everywhere, with no flat region, so every ray retains a
-    /// direction to improve and a pose whose wall rays all start far away can
-    /// still be pulled in. That is what the previous hard clamp destroyed.
-    /// Second, the kernel is bounded, so no single bad cluster of rays can drive
-    /// the score, which is why a robust kernel is used here rather than a plain
-    /// Gaussian plus an outlier cutoff.
+    /// Being bounded also means no single ray can dominate the mean, which is why
+    /// a robust kernel is used rather than an unweighted squared error. Rays that
+    /// were occluded do not come through here at all: they are scored at the
+    /// floor by <see cref="ScorePose"/>.
     /// </summary>
-    private static float PointScore(float distance)
+    private static float PointScore(float range_error)
     {
         float rolloff_squared = SCORE_ROLLOFF_MM * SCORE_ROLLOFF_MM;
-        return rolloff_squared / (rolloff_squared + 2f * distance * distance);
+        return rolloff_squared / (rolloff_squared + 2f * range_error * range_error);
     }
 
     /// <summary>
