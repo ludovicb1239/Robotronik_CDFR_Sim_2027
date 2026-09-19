@@ -1,5 +1,5 @@
 fileFormatVersion: 2
-guid: 5f2578d828a42e0b7baad08fe3f9aab2
+guid: 9f393128c10d59c35947ba0284601abd
 ModelImporter:
   serializedVersion: 24600
   internalIDToNameTable: []
@@ -7,28 +7,8 @@ ModelImporter:
   - first:
       type: UnityEngine:Material
       assembly: UnityEngine.CoreModule
-      name: Black
-    second: {fileID: 2100000, guid: b9d3ffe471c0bdab78868ab6bab0a7f5, type: 2}
-  - first:
-      type: UnityEngine:Material
-      assembly: UnityEngine.CoreModule
-      name: FieldBorders
-    second: {fileID: 2100000, guid: 6dc0fa04d633f894aa2058a557cb7cb9, type: 2}
-  - first:
-      type: UnityEngine:Material
-      assembly: UnityEngine.CoreModule
-      name: FieldMat
-    second: {fileID: 2100000, guid: dc72032904316f8428d37708de064f89, type: 2}
-  - first:
-      type: UnityEngine:Material
-      assembly: UnityEngine.CoreModule
-      name: Temperature
-    second: {fileID: 2100000, guid: 6d3682bb4b69e4efeb147b85f940eeb6, type: 2}
-  - first:
-      type: UnityEngine:Material
-      assembly: UnityEngine.CoreModule
-      name: Temperature.001
-    second: {fileID: 2100000, guid: ce1e49e648c4cb92389f86bfba6c7037, type: 2}
+      name: YellowBall
+    second: {fileID: 2100000, guid: d8538b46f7b359458bb29a90e0ce5580, type: 2}
   materials:
     materialImportMode: 2
     materialName: 0
@@ -65,7 +45,7 @@ ModelImporter:
     useSRGBMaterialColor: 1
     sortHierarchyByName: 1
     preBakeConvexCollisionMesh: 0
-    preBakeTriangleCollisionMesh: 1
+    preBakeTriangleCollisionMesh: 0
     importPhysicalCameras: 1
     importVisibility: 1
     importBlendShapes: 1

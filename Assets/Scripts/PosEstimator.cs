@@ -64,10 +64,6 @@ public static class PosEstimator
         new Vector2(  1000f, 1500f),
         new Vector2(  1000f,-1500f),
         new Vector2( -1000f,-1500f),
-        new Vector2( -1000f, -900f),
-        new Vector2(  -550f, -900f),
-        new Vector2(  -550f,  900f),
-        new Vector2( -1000f,  900f),
         new Vector2( -1000f, 1500f),
     };
 
@@ -896,16 +892,14 @@ public static class PosEstimator
     }
 
     /// <summary>
-    /// Records that the estimate failed. The returned position is then the
-    /// unchanged approximate position, which is indistinguishable from a perfect
-    /// estimate, so this is deliberately loud.
+    /// Records that the estimate failed, so the caller can tell a rejected scan
+    /// apart from an accepted one. The returned position is then the unchanged
+    /// approximate position, which is indistinguishable from a perfect estimate,
+    /// so the reason is kept for the caller to inspect.
     /// </summary>
     private static void Reject(string reason)
     {
         LastEstimateWasRejected = true;
         LastRejectionReason = reason;
-        Debug.LogError($"PosEstimator REJECTED the scan estimate: {reason}. " +
-                       $"Returning the approximate position unchanged, which will look " +
-                       $"like a perfect estimate at zero odometry noise.");
     }
 }

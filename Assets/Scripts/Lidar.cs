@@ -16,24 +16,7 @@ public class Lidar : MonoBehaviour
     [SerializeField] private float sensor_precision_mm = 5f;    // +/- error in mm
     [SerializeField] private LayerMask ignore_hitbox_mask;      // hit, drawn, but not measured
     [SerializeField] private LineRenderer lineRenderer;
-
-    /// <summary>
-    /// Draws the rays the obstacle filter discarded, so the classification can be
-    /// inspected visually instead of inferred from the surviving ray count. A
-    /// second renderer is used rather than recolouring the main one because the
-    /// discarded rays are not a subset of the kept ones - they are a different set
-    /// of points, drawn over the same scan.
-    /// </summary>
-    [SerializeField] private LineRenderer bad_line_renderer;
-
     private List<Vector3> hit_positions = new List<Vector3>();
-
-    /// <summary>
-    /// Hit points of the rays the filter rejected, parallel to the discarded
-    /// measurements. Drawn by <see cref="bad_line_renderer"/> and cleared with the
-    /// rest of the scan.
-    /// </summary>
-    private List<Vector3> discarded_positions = new List<Vector3>();
 
     // (angle in degrees, distance in meters) measured this scan
     public List<Measurement> measurements = new List<Measurement>();
@@ -83,14 +66,6 @@ public class Lidar : MonoBehaviour
 
         lineRenderer.useWorldSpace = true;
         lineRenderer.loop = false;
-
-        // The bad renderer is optional: when it is not wired up the filter still
-        // runs and the discarded set is still tracked, it is simply not drawn.
-        if (bad_line_renderer != null)
-        {
-            bad_line_renderer.useWorldSpace = true;
-            bad_line_renderer.loop = false;
-        }
     }
 
     private void Start()
@@ -121,7 +96,6 @@ public class Lidar : MonoBehaviour
     public void BeginSweep()
     {
         hit_positions.Clear();
-        discarded_positions.Clear();
         measurements.Clear();
         scan_accumulator = 0f;
     }
@@ -142,7 +116,6 @@ public class Lidar : MonoBehaviour
     private void CastScan()
     {
         hit_positions.Clear();
-        discarded_positions.Clear();
         measurements.Clear();
 
         float degrees_per_ray = 360f / Mathf.Max(1, rays_per_scan);
@@ -155,7 +128,6 @@ public class Lidar : MonoBehaviour
         RemoveOccludedRays();
 
         UpdateLineRenderer();
-        UpdateBadLineRenderer();
     }
 
     /// <summary>
@@ -292,22 +264,12 @@ public class Lidar : MonoBehaviour
             }
         }
 
-        // Keep a ray unless both passes agree that it is occluded. Rejected rays
-        // are copied out to their own list first, so the bad renderer can draw
-        // exactly the geometry the filter removed.
+        // Keep a ray unless both passes agree that it is occluded.
         bool[] keep = new bool[count];
 
         for (int i = 0; i < count; i++)
         {
             keep[i] = !(occluded_forward[i] && occluded_backward[i]);
-        }
-
-        for (int i = 0; i < count; i++)
-        {
-            if (!keep[i] && i < hit_positions.Count)
-            {
-                discarded_positions.Add(hit_positions[i]);
-            }
         }
 
         // Rebuild both parallel lists from the surviving rays, so the drawn
@@ -400,38 +362,6 @@ public class Lidar : MonoBehaviour
         {
             lineRenderer.SetPosition(i*2, transform.position);
             lineRenderer.SetPosition(i*2+1, hit_positions[i]);
-        }
-    }
-
-    /// <summary>
-    /// Draws the rays the obstacle filter discarded, from the sensor out to the
-    /// rejected hit point, using the same paired-position layout as the main
-    /// renderer.
-    ///
-    /// Handles the empty case explicitly: a scan in which the filter rejected
-    /// nothing must clear the previous frame's lines, or the bad renderer would
-    /// keep showing geometry that is no longer being discarded. The count is set
-    /// to zero rather than left alone, so the stale positions are dropped.
-    /// </summary>
-    private void UpdateBadLineRenderer()
-    {
-        if (bad_line_renderer == null)
-        {
-            return;
-        }
-
-        if (discarded_positions.Count == 0)
-        {
-            bad_line_renderer.positionCount = 0;
-            return;
-        }
-
-        bad_line_renderer.positionCount = discarded_positions.Count * 2;
-
-        for (int i = 0; i < discarded_positions.Count; i++)
-        {
-            bad_line_renderer.SetPosition(i * 2, transform.position);
-            bad_line_renderer.SetPosition(i * 2 + 1, discarded_positions[i]);
         }
     }
 }
