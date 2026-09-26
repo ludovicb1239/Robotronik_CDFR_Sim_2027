@@ -23,6 +23,7 @@
 /[Uu]ser[Ss]ettings/
 *.log
 .venv/
+**/out/
 
 # By default unity supports Blender asset imports, *.blend1 blender files do not need to be commited to version control.
 *.blend1
@@ -67,6 +68,9 @@ ExportedObj/
 *.mdb
 *.opendb
 *.VC.db
+
+# Python Cache
+*.pyc
 
 # Unity3D generated meta files
 *.pidb.meta

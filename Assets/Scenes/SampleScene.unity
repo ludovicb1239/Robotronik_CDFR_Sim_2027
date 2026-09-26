@@ -1950,7 +1950,7 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 333403848}
   serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalRotation: {x: 0, y: -0.9999243, z: 0, w: 0.012304397}
   m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
@@ -1975,7 +1975,7 @@ Transform:
   - {fileID: 419646434}
   - {fileID: 452575826}
   m_Father: {fileID: 543450653599924922}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: -178.59, z: 0}
 --- !u!1001 &342269613
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -4170,7 +4170,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &740264817
 Transform:
   m_ObjectHideFlags: 0
@@ -6147,7 +6147,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c24ef470e03d2ff669267c817e287b81, type: 3}
   m_Name: 
   m_EditorClassIdentifier: '::'
-  captureKey: 32
   saveFolder: Captures
 --- !u!1001 &1249388496
 PrefabInstance:
@@ -7425,12 +7424,12 @@ Camera:
   m_BackGroundColor: {r: 0.19215687, g: 0.3019608, b: 0.4745098, a: 0}
   m_projectionMatrixMode: 1
   m_GateFitMode: 2
-  m_FOVAxisMode: 0
+  m_FOVAxisMode: 1
   m_Iso: 200
   m_ShutterSpeed: 0.005
   m_Aperture: 16
   m_FocusDistance: 10
-  m_FocalLength: 8.402491
+  m_FocalLength: 19.472288
   m_BladeCount: 5
   m_Curvature: {x: 2, y: 11}
   m_BarrelClipping: 0.25
@@ -7445,7 +7444,7 @@ Camera:
     height: 1
   near clip plane: 0.01
   far clip plane: 20
-  field of view: 60.2
+  field of view: 54.94614
   orthographic: 0
   orthographic size: 5
   m_Depth: 3.3
@@ -7472,7 +7471,7 @@ Transform:
   m_GameObject: {fileID: 1474529600}
   serializedVersion: 2
   m_LocalRotation: {x: -0.3556888, y: -0.6111346, z: 0.3556888, w: -0.6111346}
-  m_LocalPosition: {x: -1.07, y: 1.7, z: 0}
+  m_LocalPosition: {x: -1.07, y: 1.57, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -10374,8 +10373,8 @@ MonoBehaviour:
     pos_a: 0
   position_noise_mm: 75
   angle_noise_deg: 5
-  movement_speed: 1
-  rotation_speed: 220
+  movement_speed: 0.6
+  rotation_speed: 80
   positionnement_text: {fileID: 186686031}
 --- !u!54 &919132148372530506
 Rigidbody:
