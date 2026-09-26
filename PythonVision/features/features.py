@@ -135,25 +135,49 @@ DETECT_SCALE = 1.0
 # The map's own resolution, which is not a tunable.
 MAP_MM_PER_PX = 1.0
 
-# BRISK, and 30 rather than 40. At 40 three captures matched only 28-30 features
-# and RANSAC returned *zero* inliers among them - the survivors were noise, not
-# a weak version of the right answer. 30 recovers them (43-48 matches, 32-39
-# inliers) and solves 33/33. It is also faster than 40, because matching against
-# fewer map keypoints is what the per-capture cost is dominated by. At 20 the
-# run costs 177 ms for no accuracy gain, and 35 leaves almost no margin against
-# MIN_INLIERS, so 30 is the middle that is defensible from both sides.
-BRISK_THRESHOLD = 30
-BRISK_OCTAVES = 0            # 0 lets BRISK pick from the image size
-BRISK_PATTERN_SCALE = 1.0
-
-# Cross-check plus ratio test. Both are needed: the cross-check alone still lets
-# a patch on one side of the field match the mirrored side, because the map is
-# left-right symmetric in its textures.
+# AKAZE, not BRISK. Measured on the full 313-capture set at 4 mm/px with the
+# prior window active, comparing every detector OpenCV exposes here:
 #
-# 0.75, and the sweep showed the value barely matters: 0.70 through 0.85 all
-# solve 33/33 with identical error. So this is the conventional value rather
-# than a fitted one - there is nothing here to tune, which is worth knowing.
-RATIO_TEST = 0.75
+#   detector              mapkp  solved   err mean  err max  head mean     ms
+#   BRISK t20 o4           4904  312/313    1.10mm    5.50mm     0.06deg     64
+#   AKAZE th=0.001 r=0.85  1483  311/313    0.56mm    2.08mm     0.045deg    49
+#   KAZE                   2599   78/79     0.58mm       --         --       98
+#   SIFT ct=0.04           2198   79/79     1.81mm    3.08mm        --       50
+#   ORB 3000               3000   76/79     2.00mm       --         --       45
+#
+# AKAZE halves the error, tightens the worst case 2.6x and is 24% faster for one
+# fewer solve, so it wins on every axis but raw solve count. KAZE is equally
+# accurate but twice the runtime - it is AKAZE's unaccelerated parent. SIFT
+# solves everything but its error is 3x worse, evidently because its many weak
+# keypoints dilute the fit rather than help it. ORB is fastest and least
+# accurate; binary descriptors are simply less precise on this texture.
+#
+# AKAZE descriptors are used in their BINARY MLDB form, not the float default.
+# Same detector, same keypoints, 61 uint8 values instead of 61 float32, matched
+# with a Hamming popcount instead of an L2 sum. Measured on half the set:
+#
+#   descriptor        solved   err mean  err max     ms
+#   float (default)  156/157     0.58mm   2.08mm   47.2
+#   binary MLDB      157/157     0.53mm   1.72mm   36.4
+#
+# Better on all three axes and 23% faster, because a binary distance is a
+# popcount where an L2 distance is a sum of 61 squared differences. The
+# information content is the same; only the storage differs.
+#
+# `descriptor_size=486` is required, not a preference: OpenCV asserts unless the
+# binary descriptor is asked for at its full 486-bit width, and a partial size
+# silently returns a 1-byte descriptor instead. `descriptor_type` 4 and 5 both
+# give the binary form; 5 is MLDB, which is what AKAZE is built around.
+AKAZE_THRESHOLD = 0.001
+AKAZE_DESCRIPTOR_TYPE = 5
+AKAZE_DESCRIPTOR_SIZE = 486
+AKAZE_DESCRIPTOR_CHANNELS = 3
+
+# Ratio test. Raised from BRISK's 0.75 to 0.85 for AKAZE: at 0.85 the full set
+# solved 311/313 at 0.57mm with the float descriptor, and 0.70 dropped to 76/79
+# on a half set. AKAZE's descriptors are more selective, so a looser ratio still
+# rejects the mirrored decoys that the mutual cross-check catches anyway.
+RATIO_TEST = 0.85
 
 # RANSAC reprojection tolerance, in millimetres on the working grid.
 RANSAC_MM = 6.0
@@ -171,13 +195,18 @@ MIN_INLIER_SPAN_MM = 300.0
 # Odometry prior. The caller knows roughly where the robot is, so only the map
 # features that could possibly be in view are offered to the matcher.
 #
-# Measured honestly: at these defaults it buys speed and not accuracy. It cuts
-# the run from 52 ms to 38 ms, but leaves the error identical (11.4 mm mean,
-# 110.3 mm max) with or without it, because a +/-100 mm disc plus the footprint
-# is still wide enough to contain the mirrored twin. Kept because it is the
-# right shape for the real fix and costs nothing, but it is not yet earning its
-# keep.
-PRIOR_POS_MM = 100.0
+# `PRIOR_POS_MM` is now 0: the window is exactly the projected camera view, with
+# no extra margin. The old +/-100 mm disc could not filter anything anyway - a
+# symmetric box that wide came out ~5220x5482 mm against a 2000x3000 mm field -
+# and once the window became the directional patch footprint, the extra 100 mm
+# was pure slack on top of a region already sized to what the camera sees.
+#
+# The cost of 0 is that any prior error immediately hides the true match, since
+# the window no longer tolerates being wrong. That is the point of the value
+# being a parameter rather than a constant to be tuned by taste: `--prior-noise`
+# exercises it, and a run at +/-100 mm noise against a 0 mm window is the
+# honest test of whether the caller's odometry is good enough to use this.
+PRIOR_POS_MM = 0.0
 PRIOR_YAW_DEG = 15.0
 
 # Simulated odometry error, applied to the ground-truth pose before it reaches
@@ -367,6 +396,12 @@ def prior_window_mm(px: float, py: float, yaw_deg: float,
     Returned as (x0, y0, x1, y1) in field millimetres. The yaw slack is applied
     by rotating the offset the robot's centre could have, because a yaw error
     moves the ground the camera is looking at sideways, not the robot.
+
+    This is the *shape-agnostic* fallback. It cannot filter usefully on this
+    field - measured, a symmetric window comes out ~5220x5482 mm against a
+    2000x3000 mm field, wider than the field in every direction, so it admits
+    every map keypoint. Use `camera_view_window_mm` instead, which projects the
+    patch's real footprint and is therefore directional.
     """
     if pos_mm <= 0 and yaw_deg_slack <= 0 and footprint_mm <= 0:
         return np.array([px, py, px, py], np.float64)
@@ -392,6 +427,102 @@ def prior_window_mm(px: float, py: float, yaw_deg: float,
     return np.array([x0, y0, x1, y1], np.float64)
 
 
+def patch_reach_mm(rectified: np.ndarray, warper: GroundWarper) -> float:
+    """How far the camera actually sees, as a radius in millimetres from the robot.
+
+    The old code used `max(rectified.shape) * mm_per_px`, which is the *warp
+    output's* longest side - the bounding box of ground the camera could
+    conceivably see, not what it does see. At a 45 degree down-pitch about half
+    of that box is the black fill, and the number came out at 2560 mm. Added as
+    a radius in all four directions it made the window ~5320 mm across, wider
+    than the 2000x3000 mm field, so the window admitted every map keypoint and
+    the prior did nothing.
+
+    The honest figure is the farthest valid (non-fill) pixel from the camera's
+    own position in the patch, measured radially. That is ~1815 mm here and
+    asymmetric - the camera sees ahead only, y running -1328 to -44 mm - but a
+    radius is what `prior_window_mm` needs, and a radius must cover the worst
+    case in any direction.
+    """
+    valid = rectified != 0
+    if not valid.any():
+        # No ground at all: fall back to the output extents rather than
+        # returning zero, so a degenerate patch cannot silently tighten the
+        # window around the prior itself.
+        return float(max(rectified.shape[:2]) * warper.mm_per_px)
+    ys, xs = np.nonzero(valid)
+    cam = camera_patch_px(warper)
+    dx = (xs - cam[0]) * warper.mm_per_px
+    dy = (ys - cam[1]) * warper.mm_per_px
+    return float(np.hypot(dx, dy).max())
+
+
+def camera_view_window_mm(rectified: np.ndarray, warper: GroundWarper,
+                          px: float, py: float, yaw_deg: float,
+                          pos_mm: float = PRIOR_POS_MM,
+                          yaw_deg_slack: float = PRIOR_YAW_DEG) -> np.ndarray:
+    """The ground the camera sees, placed on the field by the prior, as a box.
+
+    The symmetric window in `prior_window_mm` cannot filter on this field: a
+    radius covering the patch's reach is wider than the field itself, so it
+    admits every map keypoint and the prior does nothing. What actually
+    constrains the answer is the shape of the view.
+
+    This projects the corners of the patch's *valid* region - the ground the
+    camera really saw, excluding the warp's fill - into the robot frame, then
+    places that quadrilateral on the field at the prior pose, sweeping it
+    through the yaw slack and growing the result by the position slack. The
+    bounding box of that sweep contains every map keypoint that could possibly
+    appear in the patch, and unlike a disc it does not extend backwards, where
+    the camera cannot see.
+
+    `rectified` is used only to find which patch pixels held ground; its size
+    also sets the sampling stride for the corner extraction, so a large patch
+    does not cost a huge projection.
+    """
+    valid = rectified != 0
+    if not valid.any():
+        # No ground at all: fall back to the conservative disc, so a degenerate
+        # patch cannot silently tighten the window around the prior itself.
+        return prior_window_mm(px, py, yaw_deg, pos_mm, yaw_deg_slack,
+                               patch_reach_mm(rectified, warper))
+
+    # Trace the valid region's outline and project it into the robot frame.
+    # Approximating with the convex hull of the valid pixels rather than their
+    # bounding box keeps the wedge shape: the bounding box of a rotated patch
+    # would be back to being far too wide.
+    contours, _ = cv.findContours(valid.astype(np.uint8), cv.RETR_EXTERNAL,
+                                  cv.CHAIN_APPROX_SIMPLE)
+    pts = np.vstack([c.reshape(-1, 2) for c in contours]).astype(np.float64)
+    if len(pts) == 0:
+        return prior_window_mm(px, py, yaw_deg, pos_mm, yaw_deg_slack,
+                               patch_reach_mm(rectified, warper))
+    hull = cv.convexHull(pts.astype(np.float32)).reshape(-1, 2).astype(np.float64)
+    # Robot frame: x forwards, y left. `warper.robot_mm` docs the sign flip.
+    robot = GroundWarper.robot_mm(warper, hull)          # (N, 2) in mm
+
+    # Sweep the hull through the yaw slack: a yaw error rotates the ground the
+    # camera sees about the robot, so every reachable rotation has to be inside
+    # the window.
+    angles = ([0.0] if yaw_deg_slack <= 0 else
+              list(np.linspace(-yaw_deg_slack, yaw_deg_slack, 9)))
+    corners = []
+    for a in angles:
+        r = np.radians(yaw_deg + a)
+        # Robot frame -> field frame, then translate to the prior position.
+        fx = px + robot[:, 0] * np.cos(r) - robot[:, 1] * np.sin(r)
+        fy = py + robot[:, 0] * np.sin(r) + robot[:, 1] * np.cos(r)
+        corners.append(np.stack([fx, fy], 1))
+    allc = np.vstack(corners)
+
+    # A yaw error also rotates the footprint about the robot, so the position
+    # slack is added on top of the swept hull rather than inside it.
+    pad = max(0.0, pos_mm)
+    return np.array([float(allc[:, 0].min() - pad), float(allc[:, 1].min() - pad),
+                     float(allc[:, 0].max() + pad),
+                     float(allc[:, 1].max() + pad)], np.float64)
+
+
 def window_features(field_map: FieldMap, window_mm: np.ndarray,
                     points_px: np.ndarray, descriptors: np.ndarray
                     ) -> tuple[np.ndarray, np.ndarray, int]:
@@ -401,8 +532,17 @@ def window_features(field_map: FieldMap, window_mm: np.ndarray,
     never saw, which is the number worth watching: a window that hides the true
     match is a wrong prior, not a matcher failure, and looks identical from the
     outside except for a collapse in matches.
+
+    The `points_px is None` guard below is a real hazard: it silently returns
+    everything, so a caller that builds a `FieldMap` via `load_map` without
+    assigning `points_px` gets no filtering at all and a `dropped` of 0 that
+    looks like "the window excluded nothing" rather than "the window never ran".
+    It cost two sweeps before being caught. The assert makes that a crash.
     """
     if field_map.points_px is None or len(points_px) == 0:
+        assert field_map.points_px is not None, (
+            "window_features called with FieldMap.points_px unset - the window "
+            "would be bypassed silently. Set field_map.points_px first.")
         return points_px, descriptors, 0
 
     mm = field_map.px_to_field_mm(points_px)
@@ -415,37 +555,53 @@ def window_features(field_map: FieldMap, window_mm: np.ndarray,
 # --- Features --------------------------------------------------------------
 
 
-def _brisk_factory() -> object:
-    """BRISK moved from `cv2` to `cv2.xfeatures2d` in OpenCV 5, so accept both.
+def _akaze_factory():
+    """AKAZE moved from `cv2` to `cv2.xfeatures2d` in OpenCV 5, so accept both.
 
-    Resolved once, at import, rather than per call: a missing BRISK should fail
+    Resolved once, at import, rather than per call: a missing AKAZE should fail
     loudly at start-up with a clear message, not part-way through a run.
     """
-    if hasattr(cv, "BRISK_create"):
-        return cv.BRISK_create
-    if hasattr(cv, "xfeatures2d") and hasattr(cv.xfeatures2d, "BRISK_create"):
-        return cv.xfeatures2d.BRISK_create
+    if hasattr(cv, "AKAZE_create"):
+        return cv.AKAZE_create
+    if hasattr(cv, "xfeatures2d") and hasattr(cv.xfeatures2d, "AKAZE_create"):
+        return cv.xfeatures2d.AKAZE_create
     raise RuntimeError(
-        "BRISK is unavailable: no cv.BRISK_create or cv.xfeatures2d.BRISK_create "
+        "AKAZE is unavailable: no cv.AKAZE_create or cv.xfeatures2d.AKAZE_create "
         f"in OpenCV {cv.__version__}. Install 'opencv-contrib-python'.")
 
 
-BRISK_CREATE = _brisk_factory()
+AKAZE_CREATE = _akaze_factory()
 
 
-def build_detector(threshold: int = BRISK_THRESHOLD):
-    # Positional: the parameter is `thresh` in OpenCV 5 and `threshold` in 4.
-    return BRISK_CREATE(threshold, BRISK_OCTAVES, BRISK_PATTERN_SCALE)
+def build_detector(threshold: float = AKAZE_THRESHOLD):
+    """AKAZE with the response floor set, emitting binary MLDB descriptors.
+
+    The descriptor arguments are not optional tuning: `descriptor_type=5` is the
+    binary MLDB form and `descriptor_size=486` is its required full width. See
+    the constants for the measurement that chose binary over float, and for what
+    happens if the size is wrong.
+    """
+    return AKAZE_CREATE(threshold=threshold,
+                        descriptor_type=AKAZE_DESCRIPTOR_TYPE,
+                        descriptor_size=AKAZE_DESCRIPTOR_SIZE,
+                        descriptor_channels=AKAZE_DESCRIPTOR_CHANNELS)
+
+
+# Descriptor element type, for the fallback empty array when nothing is found.
+# The binary MLDB form is uint8; the float default was float32. The shape is
+# what callers index on, so it has to be right even when empty.
+DESC_DTYPE = np.uint8
+DESC_WIDTH = 61
 
 
 def detect(image: np.ndarray, detector) -> tuple[list, np.ndarray]:
-    """Keypoints and their BRISK descriptors, as (keypoints, Nx64 uint8 array).
+    """Keypoints and their AKAZE descriptors, as (keypoints, Nx64 float array).
 
     With `SCALE["detect_scale"] > 1` the image is decimated before detection and
     the keypoints are scaled back up afterwards, so callers still receive
     coordinates on the working grid and nothing downstream needs to know. This
     trades real accuracy for detection time: at 2.0 roughly three quarters of the
-    pixels are discarded before BRISK ever sees them, and a descriptor computed
+    pixels are discarded before AKAZE ever sees them, and a descriptor computed
     on the decimated image is not the same descriptor.
     """
     factor = SCALE["detect_scale"]
@@ -456,7 +612,7 @@ def detect(image: np.ndarray, detector) -> tuple[list, np.ndarray]:
                          interpolation=cv.INTER_AREA)
     keypoints, descriptors = detector.detectAndCompute(work, None)
     if descriptors is None:
-        return list(keypoints), np.zeros((0, 64), np.uint8)
+        return list(keypoints), np.zeros((0, DESC_WIDTH), DESC_DTYPE)
     if factor > 1.0:
         # Rescale the keypoint geometry, not just the coordinates: a descriptor
         # is only reusable at the size it was computed, but the *position* has
@@ -476,11 +632,135 @@ def keypoint_px(keypoints: list) -> np.ndarray:
     return np.array([kp.pt for kp in keypoints], np.float64)
 
 
+# Padding the map before detection was tried and removed. It gave BRISK's
+# sampling ring real pixels to work with near the border, and did raise the
+# solve rate when first added (208/313 -> 311/313 on an earlier set). But once
+# measured, the keypoints it added were almost all unusable: of 404 keypoints
+# within 10 px of the border, the mutual-match rate was 0.26% (82 matches from
+# 31916 opportunities over 79 frames). A keypoint near the border has part of
+# its sampling ring over the flat pad, so its descriptor is real texture diluted
+# by a constant, and the patch side of a would-be match has its ring over the
+# warp's black fill instead - the two never describe the same shape.
+#
+# Removing it costs 1258 keypoints, all of them the degraded border ones, and:
+#   with pad   : mapkp 6162  solved 157/157  err 1.02/3.16mm  82.6 ms
+#   without pad: mapkp 4904  solved 157/157  err 1.04/5.52mm  74.9 ms
+# The solve rate is untouched and the run is 9% faster, so the padding is gone.
+# `detect_map` is kept as the map entry point so call sites do not change; it no
+# longer pads, and the second return value is always 0.
+MAP_PAD_PX = 0
+MAP_PAD_VALUE = 40          # only used by the diagnostic view
+
+
+class KeypointList(list):
+    """A list of keypoints that may carry diagnostics alongside.
+
+    A plain `list` cannot take an attribute. With padding removed the
+    `dropped_in_pad` list is always empty, but the views still read it, so the
+    subclass stays as the stable shape they expect.
+    """
+
+    dropped_in_pad: list = []
+
+
+def detect_map(gray: np.ndarray, detector) -> tuple[list, np.ndarray, int]:
+    """Detect keypoints on the map. Returns `(keypoints, descriptors, pad)`.
+
+    `pad` is always 0 now: padding was removed after measurement showed its
+    border keypoints matched at 0.26% and cost 9% of the runtime. The return
+    shape is kept so existing callers and the diagnostic views do not change.
+
+    Keypoints are `KeypointList` carrying an empty `dropped_in_pad`, so views
+    that expect that attribute keep working.
+    """
+    kps, desc = detect(gray, detector)
+    kept = KeypointList(kps)
+    kept.dropped_in_pad = []
+    return kept, desc, 0
+
+
+def draw_padded_map(gray: np.ndarray, pad: int, keypoints: list,
+                    colour: tuple[int, int, int]) -> np.ndarray:
+    """The map as the detector saw it: padded, with kept and discarded features.
+
+    Kept keypoints are drawn at their `+pad` positions so they line up with the
+    padded canvas; the discarded ones are drawn in the artefact colour and are
+    the only place they are ever shown. The pad region is tinted so its extent
+    is unambiguous, and the true field boundary is outlined.
+    """
+    padded = cv.copyMakeBorder(gray, pad, pad, pad, pad, cv.BORDER_CONSTANT,
+                               value=MAP_PAD_VALUE)
+    frame = cv.cvtColor(padded, cv.COLOR_GRAY2BGR)
+    frame = imageio.resize_longest_side(frame, FEATURE_MAX_SIDE)
+    scale = frame.shape[1] / float(padded.shape[1])
+
+    # Tint the pad so it reads as synthetic rather than as dark field.
+    tint = frame.copy()
+    tint[:pad, :] = (0, 0, 70)
+    tint[-pad:, :] = (0, 0, 70)
+    tint[:, :pad] = (0, 0, 70)
+    tint[:, -pad:] = (0, 0, 70)
+    frame = cv.addWeighted(tint, 0.5, frame, 0.5, 0)
+    # The true field boundary, so the seam is visible.
+    cv.rectangle(frame, (int(pad * scale), int(pad * scale)),
+                 (int((padded.shape[1] - pad) * scale),
+                  int((padded.shape[0] - pad) * scale)), (255, 255, 255), 1,
+                 cv.LINE_AA)
+
+    def mark(kp, col):
+        c = (int(round(kp.pt[0] * scale)), int(round(kp.pt[1] * scale)))
+        if not (0 <= c[0] < frame.shape[1] and 0 <= c[1] < frame.shape[0]):
+            return
+        # Filled dot, radius from the real keypoint scale, halved and capped.
+        r = max(1, min(FEATURE_MAX_RADIUS, int(round(kp.size * scale / 2.0))))
+        cv.circle(frame, c, r, col, -1, cv.LINE_AA)
+
+    dropped = getattr(keypoints, "dropped_in_pad", [])
+    for kp in dropped:
+        mark(kp, FEATURE_EDGE_COLOR)
+    for kp in keypoints:
+        # `keypoints` came back shifted by -pad; undo that for this view.
+        mark(_Shifted(kp, pad), colour)
+    text = (f"padded by {pad}px   kept {len(keypoints)}   "
+            f"discarded in pad {len(dropped)}")
+    font, thickness = 0.6, 2
+    while font > 0.3:
+        (tw, _), _ = cv.getTextSize(text, cv.FONT_HERSHEY_SIMPLEX, font, thickness)
+        if tw <= frame.shape[1] - 20:
+            break
+        font -= 0.05
+        if font <= 0.5:
+            thickness = 1
+    cv.putText(frame, text, (10, 26), cv.FONT_HERSHEY_SIMPLEX, font,
+               (255, 255, 255), thickness, cv.LINE_AA)
+    return frame
+
+
+class _Shifted:
+    """A keypoint view offset by `+dx, +dy`, for drawing in another frame.
+
+    Cheap stand-in for a real `cv.KeyPoint` so the same marker code can draw a
+    keypoint whose coordinates were shifted back to the unpadded frame.
+    """
+
+    __slots__ = ("pt", "size")
+
+    def __init__(self, kp, dx: float, dy: float = 0.0) -> None:
+        self.pt = (kp.pt[0] + dx, kp.pt[1] + dy)
+        self.size = kp.size
+
+
 # --- Matching --------------------------------------------------------------
 
 
 def build_matcher() -> cv.BFMatcher:
-    """Hamming matcher: BRISK descriptors are binary.
+    """Hamming matcher: the AKAZE descriptors are binary MLDB.
+
+    This and the detector's descriptor options must agree. A float descriptor
+    hashed through `NORM_HAMMING` produces distances that still look like
+    plausible numbers and knnMatch still returns neighbours, so a mismatch here
+    fails quietly as an accuracy drop rather than an error. See
+    `build_detector` for the descriptor form, and the constants for why binary.
 
     `crossCheck` is deliberately off. With it on, knnMatch degenerates to the
     single best match per keypoint (matching OpenCV gives each direction one
@@ -693,14 +973,23 @@ def solve_capture(path: str, warper: GroundWarper, field_map: FieldMap,
 
     candidates_px, candidates_desc = map_px, map_desc
     if prior is not None:
-        footprint_mm = float(max(rectified.shape[:2]) * warper.mm_per_px)
-        window = prior_window_mm(prior[0], prior[1], prior[2], PRIOR_POS_MM,
-                                 PRIOR_YAW_DEG, footprint_mm)
+        # The ground the camera actually sees, placed on the field by the prior.
+        # A symmetric disc cannot filter here - its radius exceeds the field - so
+        # the window is the projected patch footprint instead.
+        window = camera_view_window_mm(rectified, warper, prior[0], prior[1],
+                                       prior[2], PRIOR_POS_MM, PRIOR_YAW_DEG)
         candidates_px, candidates_desc, dropped = window_features(
             field_map, window, map_px, map_desc)
         solve.map_candidates = len(candidates_px)
         solve.map_dropped = dropped
         view["window"] = window
+        # Which map keypoints the window admitted, as a boolean over the full
+        # set, so the window view can colour them without re-deriving the test.
+        mm = field_map.px_to_field_mm(map_px)
+        x0, y0, x1, y1 = window
+        view["window_keep"] = ((mm[:, 0] >= x0) & (mm[:, 0] <= x1)
+                               & (mm[:, 1] >= y0) & (mm[:, 1] <= y1))
+        view["candidates_px"] = candidates_px
     else:
         solve.map_candidates = len(map_px)
 
@@ -720,6 +1009,8 @@ def solve_capture(path: str, warper: GroundWarper, field_map: FieldMap,
             solve.heading_deg = heading
             view["matches"] = draw_matches(rectified, field_map.gray,
                                            patch_px[qi], candidates_px[ti], mask)
+            # The admitted keypoints that survived the fit, for the window view.
+            view["inlier_px"] = candidates_px[ti][mask.astype(bool)]
         elif keep_matches:
             # Matches but no fit: draw them all so the frame is not blank.
             view["matches"] = draw_matches(rectified, field_map.gray,
@@ -773,6 +1064,13 @@ MATCH_REJECT_LINE_THICKNESS = 1
 # downscaling to this makes each keypoint a few pixels and the density legible.
 FEATURE_MAX_SIDE = 1200
 FEATURE_COLOR = (0, 255, 0)
+# Marker radius is the keypoint's real scale, halved, capped here. The cap is
+# not cosmetic: with BRISK_OCTAVES = 3 sizes run roughly 8-70 px, and an
+# uncapped 70 px feature draws a 35 px radius on a 500 px wide map, which swamps
+# the image. The cap keeps the size *ordering* visible without letting the
+# largest features dominate. Drawn as filled dots rather than hollow rings so
+# that thousands of them stay countable.
+FEATURE_MAX_RADIUS = 9
 # Keypoints standing on the edge of the rectified patch's valid region. Drawn in
 # a warning colour because they are detector artefacts from the warp's intensity
 # cliff, not features on the field.
@@ -1080,19 +1378,26 @@ def draw_keypoints(image: np.ndarray, keypoints: list,
     # Which pixels held no ground, i.e. the warp's fill. Pixel value alone does
     # not identify it: the map legitimately contains black markings (2% of its
     # pixels are exactly 0), so `image == 0` would mark real content as an
-    # artefact. What does identify it is that unwarped ground cannot reach the
-    # frame edge - the warp's valid region is bounded by the camera's field of
-    # view - so the fill is the zero-valued component touching the border.
+    # artefact. The fill is also not simply "the component touching the border":
+    # measured on the map, five zero-valued components touch the frame edge,
+    # because the field's own boundary lines run along it. What separates the
+    # fill from a marking is *shape* - the fill is a broad region pinned to the
+    # frame, a marking is a thin line - so a component counts as fill only if it
+    # touches the border on most of the border's length.
     invalid = np.zeros(image.shape, bool)
     if (image == 0).any():
         n_lab, labels = cv.connectedComponents((image == 0).astype(np.uint8))
-        border = np.zeros(n_lab, bool)
-        border[labels[0, :]] = True
-        border[labels[-1, :]] = True
-        border[labels[:, 0]] = True
-        border[labels[:, -1]] = True
-        border[0] = False                    # label 0 is the non-zero background
-        invalid = border[labels]
+        h, w = image.shape
+        perim = 2 * (h + w)
+        for lab in range(1, n_lab):
+            touching = (int((labels[0, :] == lab).sum())
+                        + int((labels[-1, :] == lab).sum())
+                        + int((labels[:, 0] == lab).sum())
+                        + int((labels[:, -1] == lab).sum()))
+            # A fill spans a long stretch of the frame edge; a marking that
+            # happens to reach it touches a short run.
+            if touching >= 0.25 * perim:
+                invalid |= (labels == lab)
 
     edge_px = np.zeros(image.shape, bool)
     if invalid.any() and not invalid.all():
@@ -1114,17 +1419,20 @@ def draw_keypoints(image: np.ndarray, keypoints: list,
         c = (int(round(kp.pt[0] * scale)), int(round(kp.pt[1] * scale)))
         if not (0 <= c[0] < frame.shape[1] and 0 <= c[1] < frame.shape[0]):
             continue
-        radius = int(np.clip(kp.size * scale / 2.0, 1.5, 9.0))
+        # Filled dot, radius from the real keypoint scale, halved and capped.
+        radius = max(1, min(FEATURE_MAX_RADIUS,
+                            int(round(kp.size * scale / 2.0))))
         # A keypoint is "on the boundary" if its own pixel or its immediate
         # neighbourhood straddles the valid/invalid split.
         if edge_px.any() and 0 <= py < image.shape[0] and 0 <= px < image.shape[1]:
             if edge_px[py, px] or invalid[py, px]:
                 on_edge += 1
-                cv.circle(frame, c, radius, FEATURE_EDGE_COLOR, 1, cv.LINE_AA)
-                cv.circle(frame, c, 1, FEATURE_EDGE_COLOR, -1, cv.LINE_AA)
+                # Ring rather than dot, so the artefacts stay separable from
+                # the real features even where the two overlap.
+                cv.circle(frame, c, max(2, radius), FEATURE_EDGE_COLOR, 1,
+                          cv.LINE_AA)
                 continue
-        cv.circle(frame, c, radius, colour, 1, cv.LINE_AA)
-        cv.circle(frame, c, 1, colour, -1, cv.LINE_AA)
+        cv.circle(frame, c, radius, colour, -1, cv.LINE_AA)
 
     text = f"{len(keypoints)} keypoints"
     if on_edge:
@@ -1146,6 +1454,82 @@ def draw_keypoints(image: np.ndarray, keypoints: list,
     cv.putText(frame, text, (10, 26), cv.FONT_HERSHEY_SIMPLEX, font,
                (255, 255, 255), thickness, cv.LINE_AA)
     return frame
+
+
+def draw_window_map(field_map: FieldMap, keep: np.ndarray,
+                    window_mm: np.ndarray, solve: "Solve",
+                    inlier_px: np.ndarray | None = None) -> np.ndarray:
+    """The map with every keypoint coloured by what the window did with it.
+
+    Three states, and the distinction between the first two is the whole point:
+    keypoints the window admitted, keypoints it rejected, and - where a fit was
+    found - the admitted ones that became RANSAC inliers. A frame whose inliers
+    are all well inside the window is the window working as intended; one whose
+    inliers sit on the boundary is a warning that the window is clipping the
+    answer, which is what `map_dropped` counts but cannot show.
+
+    Drawn on the map at working resolution, so the marker positions are the real
+    keypoint positions and the window edge can be read against them.
+    """
+    frame = cv.cvtColor(field_map.gray, cv.COLOR_GRAY2BGR)
+    pts = field_map.points_px
+    if pts is None or not len(pts):
+        return frame
+
+    inlier_set = set()
+    if inlier_px is not None and len(inlier_px):
+        # Match by position: the inlier array is a subset of the admitted points,
+        # so an exact-coordinate lookup is enough and avoids carrying indices
+        # through solve_rigid.
+        for p in inlier_px:
+            inlier_set.add((float(p[0]), float(p[1])))
+
+    rejected = np.flatnonzero(~keep)
+    allowed = np.flatnonzero(keep)
+    for i in rejected:
+        c = tuple(np.rint(pts[i]).astype(int))
+        cv.circle(frame, c, 2, WINDOW_REJECT_COLOR, -1, cv.LINE_AA)
+    for i in allowed:
+        c = tuple(np.rint(pts[i]).astype(int))
+        is_inlier = (float(pts[i][0]), float(pts[i][1])) in inlier_set
+        cv.circle(frame, c, 5 if is_inlier else 3,
+                  WINDOW_INLIER_COLOR if is_inlier else WINDOW_ALLOW_COLOR,
+                  -1, cv.LINE_AA)
+
+    # The window rectangle, in map pixels. Both corners are transformed and then
+    # sorted: `field_to_map_px` already flips y (field y is up, map rows grow
+    # down), so swapping the corners by hand after transforming double-flips and
+    # draws the box mirrored. Sorting the pixel results is correct whichever way
+    # the transform orders them, and stays correct if the window extends off the
+    # map, where the corners can come out in either order.
+    ax, ay = field_map.field_to_map_px(window_mm[0], window_mm[1])
+    bx, by = field_map.field_to_map_px(window_mm[2], window_mm[3])
+    cv.rectangle(frame, (int(round(min(ax, bx))), int(round(min(ay, by)))),
+                 (int(round(max(ax, bx))), int(round(max(ay, by)))),
+                 WINDOW_EDGE_COLOR, 1, cv.LINE_AA)
+
+    text = (f"{len(allowed)} allowed   {len(rejected)} rejected   "
+            f"{len(inlier_set)} inlier")
+    font, thickness = 0.6, 2
+    while font > 0.3:
+        (tw, _), _ = cv.getTextSize(text, cv.FONT_HERSHEY_SIMPLEX, font, thickness)
+        if tw <= frame.shape[1] - 20:
+            break
+        font -= 0.05
+        if font <= 0.5:
+            thickness = 1
+    cv.putText(frame, text, (10, 26), cv.FONT_HERSHEY_SIMPLEX, font,
+               (255, 255, 255), thickness, cv.LINE_AA)
+    return frame
+
+
+# Window view colours. Rejected keypoints are drawn small and dark so they read
+# as background, allowed ones larger and dim, inliers largest and bright: the
+# eye then goes straight to whether the inliers sit inside the rectangle.
+WINDOW_REJECT_COLOR = (80, 80, 80)
+WINDOW_ALLOW_COLOR = (180, 180, 0)
+WINDOW_INLIER_COLOR = (0, 0, 255)
+WINDOW_EDGE_COLOR = (0, 215, 255)
 
 
 # --- Main ------------------------------------------------------------------
@@ -1217,7 +1601,7 @@ def sweep_scales(scales: list[float], captures: list[str], map_path: str,
         field_map = load_map(map_path, scale)
         detector = build_detector()
         matcher = build_matcher()
-        map_kps, map_desc = detect(field_map.gray, detector)
+        map_kps, map_desc, _ = detect_map(field_map.gray, detector)
         map_px = keypoint_px(map_kps)
 
         errs, heads, elapsed, solved = [], [], 0.0, 0
@@ -1263,7 +1647,7 @@ def run(captures: list[str], out_dir: str, args) -> int:
     detector = build_detector()
     matcher = build_matcher()
     t0 = time.perf_counter()
-    map_kps, map_desc = detect(field_map.gray, detector)
+    map_kps, map_desc, map_pad = detect_map(field_map.gray, detector)
     map_build_ms = (time.perf_counter() - t0) * 1000.0
     field_map.keypoints = map_kps
     field_map.descriptors = map_desc
@@ -1277,13 +1661,13 @@ def run(captures: list[str], out_dir: str, args) -> int:
               f"(native {field_map.native_mm_per_px:.3f})")
         print(f"patch     : rectified {warper.out_size[0]}x{warper.out_size[1]} "
               f"px @ {warper.mm_per_px:.3f} mm/px")
-        print(f"detector  : BRISK threshold {BRISK_THRESHOLD}, "
+        print(f"detector  : AKAZE threshold {AKAZE_THRESHOLD}, "
               f"{len(map_kps)} map keypoints in {map_build_ms:.0f} ms")
         print(f"grid      : {args.scale:.2f} mm/px working, "
               f"detect at {args.detect_scale:.2f}x, "
               f"min inliers {ACTIVE['min_inliers']:.0f}, "
               f"ransac {ACTIVE['ransac_px']:.1f} px")
-        print(f"matcher   : Hamming, ratio {RATIO_TEST}, cross-checked")
+        print(f"matcher   : L2, ratio {RATIO_TEST}, cross-checked")
         if args.no_prior:
             print("prior     : none, whole map offered to the matcher")
         else:
@@ -1342,14 +1726,18 @@ def run(captures: list[str], out_dir: str, args) -> int:
         if solve.robot_mm is None:
             print(f"{solve.capture}\n   NO FIX  ({solve.keypoints} kp, "
                   f"{solve.good_matches} matches, "
-                  f"{solve.map_dropped} map kp outside window)")
+                  f"{solve.map_candidates} of {len(map_px)} map kp offered, "
+                  f"{solve.map_dropped} outside window)")
         else:
             print(f"{solve.capture}\n"
                   f"   robot=({solve.robot_mm[0]:+7.1f},{solve.robot_mm[1]:+7.1f})"
                   f"mm  heading={solve.heading_deg:+7.2f}deg"
                   f"  [{solve.keypoints} kp, {solve.good_matches} match, "
                   f"{solve.inliers} inlier, scale {solve.fitted_scale:.3f}, "
-                  f"{solve.ms:.0f} ms]")
+                  f"{solve.ms:.0f} ms]"
+                  f"\n      window: {solve.map_candidates} of {len(map_px)} map kp "
+                  f"offered, {solve.map_dropped} outside"
+                  f" ({100.0 * solve.map_dropped / max(len(map_px), 1):.0f}% cut)")
             if solve.truth_mm is not None:
                 print(f"      truth=({solve.truth_mm[0]:+7.1f},"
                       f"{solve.truth_mm[1]:+7.1f})mm  yaw="
@@ -1402,6 +1790,29 @@ def run(captures: list[str], out_dir: str, args) -> int:
         cv.imwrite(os.path.join(feats_dir, "map_keypoints.png"),
                    draw_keypoints(field_map.gray, field_map.keypoints,
                                   FEATURE_COLOR, "map"))
+        # The padded view exists to make the padding visible: where the synthetic
+        # border sits, which keypoints were found inside it and therefore
+        # discarded, and that real keypoints now reach the true field edge. Drawn
+        # in the *padded* coordinate frame, so the keypoints are re-shifted by
+        # `pad` here rather than being used as `points_px` gives them.
+        cv.imwrite(os.path.join(feats_dir, "map_keypoints_padded.png"),
+                   draw_padded_map(field_map.gray, map_pad, map_kps,
+                                   FEATURE_COLOR))
+        # One window view per capture: which map keypoints the prior admitted,
+        # which it cut, and which of the admitted ones the fit used.
+        win_dir = os.path.join(feats_dir, "windows")
+        os.makedirs(win_dir, exist_ok=True)
+        written_win = 0
+        for path, solve in zip(captures, solves):
+            view = views.get(os.path.basename(path)[:-4])
+            if view is None or "window" not in view:
+                continue
+            cv.imwrite(os.path.join(win_dir,
+                                    f"window_{capture_stem(path)}.png"),
+                       draw_window_map(field_map, view["window_keep"],
+                                       view["window"], solve,
+                                       view.get("inlier_px")))
+            written_win += 1
         written_feats = 0
         for path in captures:
             view = views.get(os.path.basename(path)[:-4])
@@ -1414,6 +1825,7 @@ def run(captures: list[str], out_dir: str, args) -> int:
                                       os.path.basename(path)[:-4]))
             written_feats += 1
         print(f"Feats  : {feats_dir}/ (map + {written_feats} patch image(s))")
+        print(f"Windows: {win_dir}/ ({written_win} image(s))")
 
     if args.frames and views:
         frames_dir = os.path.join(out_dir, "frames")
@@ -1451,7 +1863,6 @@ def run(captures: list[str], out_dir: str, args) -> int:
               f"-c:v libx264 -pix_fmt yuv420p '{os.path.relpath(video_path)}'")
 
     return 0 if fixed else 1
-
 
 # `capture_sort_key` and the id regex live in `common.pose`; named here so the
 # call sites read the same as they did when they were module globals.
