@@ -12,6 +12,11 @@ ModelImporter:
   - first:
       type: UnityEngine:Material
       assembly: UnityEngine.CoreModule
+      name: Blue
+    second: {fileID: 2100000, guid: 992dcaaccda2fbbc0adaa63129e3f73e, type: 2}
+  - first:
+      type: UnityEngine:Material
+      assembly: UnityEngine.CoreModule
       name: FieldBorders
     second: {fileID: 2100000, guid: 6dc0fa04d633f894aa2058a557cb7cb9, type: 2}
   - first:
@@ -29,6 +34,11 @@ ModelImporter:
       assembly: UnityEngine.CoreModule
       name: Temperature.001
     second: {fileID: 2100000, guid: ce1e49e648c4cb92389f86bfba6c7037, type: 2}
+  - first:
+      type: UnityEngine:Material
+      assembly: UnityEngine.CoreModule
+      name: Yellow
+    second: {fileID: 2100000, guid: 0bdadc292e1b232689a9e4ed2183b8c3, type: 2}
   materials:
     materialImportMode: 2
     materialName: 0

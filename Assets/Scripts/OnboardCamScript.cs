@@ -58,7 +58,8 @@ public class OnboardCamScript : MonoBehaviour
 
     private void Capture(Vector3 cameraPosition, Vector3 cameraEuler)
     {
-        RenderTexture rt = GetComponent<Camera>().targetTexture;
+        Camera cam = GetComponent<Camera>();
+        RenderTexture rt = cam.targetTexture;
         if (rt == null)
         {
             Debug.LogWarning("OnboardCamScript: camera has no target RenderTexture.");
@@ -82,13 +83,33 @@ public class OnboardCamScript : MonoBehaviour
         if (yaw > 180) yaw -= 360;
         float pitch = cameraEuler.x;
 
+        // Field of view, in degrees. Unity's `fieldOfView` is the VERTICAL fov,
+        // so the horizontal one has to be derived from it through the aspect
+        // ratio: hfov = 2*atan(tan(vfov/2) * aspect). Both are recorded because
+        // the vertical fov is what the ground warp needs and the horizontal one
+        // is what a reader can sanity-check against the image's own proportions
+        // - deriving hfov from vfov and the aspect is only valid while the
+        // render is not letterboxed, and recording it makes that assumption
+        // checkable rather than silent.
+        //
+        // The aspect is taken from the render texture, not from `cam.aspect`:
+        // the capture is the target texture's pixels, so its shape is what the
+        // hfov has to describe. `cam.aspect` would report the window's shape and
+        // could disagree with the image being written.
+        float vfov = cam.fieldOfView;
+        float aspect = (float)rt.width / rt.height;
+        float hfov = 2f * Mathf.Atan(Mathf.Tan(vfov * 0.5f * Mathf.Deg2Rad) * aspect)
+                     * Mathf.Rad2Deg;
+
         // Invariant culture keeps the decimal point a point, so the name parses
         // the same on every machine.
         string pose =
             $"x{x.ToString("F1", CultureInfo.InvariantCulture)}" +
             $"_y{y.ToString("F1", CultureInfo.InvariantCulture)}" +
             $"_yaw{yaw.ToString("F1", CultureInfo.InvariantCulture)}" +
-            $"_pitch{pitch.ToString("F1", CultureInfo.InvariantCulture)}";
+            $"_pitch{pitch.ToString("F1", CultureInfo.InvariantCulture)}" +
+            $"_vfov{vfov.ToString("F1", CultureInfo.InvariantCulture)}" +
+            $"_hfov{hfov.ToString("F1", CultureInfo.InvariantCulture)}";
 
         Directory.CreateDirectory(saveFolder);
         string path = Path.Combine(
